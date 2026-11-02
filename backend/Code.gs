@@ -7,7 +7,7 @@
  * Потім: Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
  */
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник' };
 const M_COLS = ['id', 'eventId', 'title', 'start', 'end', 'participants', 'notes', 'folderId',
   'audioFileId', 'audioName', 'durationSec', 'engines', 'primaryEngine', 'speakerMap',
@@ -630,7 +630,9 @@ function buildDoc_(a) {
 
     const body = doc.getBody();
     body.clear();
-    body.getChild(0).asParagraph().setText(title).setHeading(DocumentApp.ParagraphHeading.TITLE);
+    const titlePara = body.getChild(0).asParagraph();
+    titlePara.setText(title);
+    titlePara.setHeading(DocumentApp.ParagraphHeading.TITLE);
     body.appendParagraph(Utilities.formatDate(st, tz, 'dd.MM.yyyy, HH:mm') + '–' + Utilities.formatDate(en, tz, 'HH:mm'));
     const names = parseJson_(row.participants, []).map(function (id) { return people[id] ? people[id].name + (people[id].role ? ' (' + people[id].role + ')' : '') : null; }).filter(String);
     if (names.length) body.appendParagraph('Учасники: ' + names.join(', '));
