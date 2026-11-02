@@ -11,7 +11,7 @@ import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from 
 import { idb, getPrepared } from './store.js';
 import { downloadFile } from './drive.js';
 
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -840,7 +840,7 @@ async function viewEdit(id, params) {
 async function viewRecord(id) {
   const t = seq;
   let m = S.meetings.get(id);
-  if (!m) { view.appendChild(spinner()); m = await api.call('getMeeting', { id }); if (!alive(t)) return; clear(view); }
+  if (!m) { view.appendChild(spinner()); m = await api.call('getMeeting', { id }); if (!alive(t)) return; clear(view); S.meetings.set(m.id, m); }
   if (S.recorder && S.recMeetingId !== id) {
     put(view, topbar('Запис', { back: '#/calendar' }), h('div', { class: 'empty' }, 'Зараз уже йде запис іншої наради.',
       h('a', { class: 'btn', href: '#/rec/' + encodeURIComponent(S.recMeetingId) }, 'Перейти до нього')));
@@ -854,6 +854,7 @@ async function viewRecord(id) {
   const pauseBtn = h('button', { class: 'btn', hidden: true }, icon('pause'), 'Пауза');
   const stopBtn = h('button', { class: 'btn primary', hidden: true }, icon('stop'), 'Завершити');
   const cancelBtn = h('button', { class: 'linkish danger', hidden: true }, 'Скасувати запис');
+  const dimBtn = h('button', { class: 'btn ghost', hidden: true, onclick: dimScreen }, '🌙 Затемнити екран');
 
   const sync = () => {
     const r = S.recorder;
@@ -862,6 +863,7 @@ async function viewRecord(id) {
     pauseBtn.hidden = !(st === 'recording' || st === 'paused');
     stopBtn.hidden = pauseBtn.hidden;
     cancelBtn.hidden = pauseBtn.hidden;
+    dimBtn.hidden = pauseBtn.hidden;
     put(clear(pauseBtn), icon(st === 'paused' ? 'mic' : 'pause'), st === 'paused' ? 'Продовжити' : 'Пауза');
     stateTxt.textContent = st === 'recording' ? 'Іде запис' : st === 'paused' ? 'Пауза' : 'Готовий до запису';
     view.querySelector('.recview')?.classList.toggle('live', st === 'recording');
@@ -875,7 +877,7 @@ async function viewRecord(id) {
 
   mainBtn.onclick = async () => {
     try {
-      const r = new Recorder({ meetingId: m.id, onLevel: level, onState: () => { sync(); updateRecPill(); } });
+      const r = new Recorder({ meetingId: m.id, onLevel: level, onState: () => { sync(); updateRecPill(); }, onInterrupted: () => finishRecording('interrupted') });
       S.recorder = r; S.recMeetingId = m.id;
       await r.start({ noiseSuppression: !!(c && c.settings.noiseSuppression) });
       sync();
@@ -886,14 +888,7 @@ async function viewRecord(id) {
     }
   };
   pauseBtn.onclick = () => { const r = S.recorder; if (!r) return; r.state === 'paused' ? r.resume() : r.pause(); sync(); };
-  stopBtn.onclick = async () => {
-    const r = S.recorder; if (!r) return;
-    const blob = await r.stop();
-    S.recorder = null; S.recMeetingId = null; updateRecPill();
-    if (!blob || !blob.size) { toast('Запис порожній', 'err'); return; }
-    const recId = r.recId;
-    startProcessing(m, blob, { fileName: 'запис з додатку', onUploaded: () => deleteRecording(recId) });
-  };
+  stopBtn.onclick = () => finishRecording('stop');
   cancelBtn.onclick = async () => {
     if (!await confirmDialog('Скасувати запис? Записане буде видалено.', 'Видалити запис', true)) return;
     const r = S.recorder; if (r) await r.discard();
@@ -907,10 +902,43 @@ async function viewRecord(id) {
       h('p', { class: 'hint' }, `${fmtDay(m.start)} · ${fmtTime(m.start)}–${fmtTime(m.end)}`),
       timer, meter, stateTxt, mainBtn,
       h('div', { class: 'row center' }, pauseBtn, stopBtn),
+      dimBtn,
       cancelBtn,
-      h('p', { class: 'hint center narrow' }, 'Поклади телефон посередині столу. Екран лишатиметься увімкненим; записане зберігається кожні 5 секунд, тож не пропаде, навіть якщо додаток закриється.')));
+      h('p', { class: 'hint center narrow' }, 'Поклади телефон посередині столу. Не вимикай екран кнопкою — натисни «Затемнити екран»: він стане чорним і майже не витрачатиме заряд, а запис ітиме далі. Записане зберігається кожні 5 секунд.')));
   sync();
   if (S.recorder) timer.textContent = fmtDuration(S.recorder.elapsed);
+}
+
+// Завершення запису: кнопкою «Завершити» або коли мікрофон несподівано відключився.
+async function finishRecording(reason) {
+  const r = S.recorder;
+  if (!r || r.state === 'stopped') return;
+  const m = S.meetings.get(S.recMeetingId);
+  const blob = await r.stop();
+  S.recorder = null; S.recMeetingId = null; updateRecPill();
+  $$('.dim').forEach(x => x.click());
+  if (reason === 'interrupted') toast('Мікрофон відключився, тому запис зупинено. Записане збережено.', 'err', 9000);
+  if (!blob || !blob.size) { toast('Запис порожній', 'err'); return; }
+  if (!m) { toast('Запис збережено на телефоні — обробиш його з календаря', 'info', 7000); return; }
+  startProcessing(m, blob, { fileName: 'запис з додатку', onUploaded: () => deleteRecording(r.recId) });
+}
+
+// Чорний екран під час запису: на OLED-екрані майже не витрачає заряд, але запис не переривається.
+function dimScreen() {
+  if (!S.recorder) return;
+  const clock = h('div', { class: 'dim-clock' });
+  const ov = h('div', { class: 'dim', role: 'button', 'aria-label': 'Повернути екран' }, clock, h('div', { class: 'dim-hint' }, 'Іде запис · торкнись, щоб повернути екран'));
+  const draw = () => { if (!S.recorder) { close(); return; } clock.textContent = fmtDuration(S.recorder.elapsed); };
+  const t1 = setInterval(draw, 1000);
+  const t2 = setInterval(() => { ov.style.paddingTop = Math.round(15 + Math.random() * 55) + 'vh'; }, 30000);
+  const close = () => {
+    clearInterval(t1); clearInterval(t2); ov.remove();
+    try { if (document.fullscreenElement) document.exitFullscreen(); } catch { }
+  };
+  ov.addEventListener('click', close);
+  document.body.appendChild(ov);
+  try { if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => { }); } catch { }
+  draw();
 }
 
 function updateRecPill() {
@@ -1047,7 +1075,7 @@ async function viewSettings() {
   const keyRows = [
     ['gemini', 'Gemini (Google AI Studio)', 'https://aistudio.google.com/apikey'],
     ['groq', 'Groq', 'https://console.groq.com/keys'],
-    ['openai', 'OpenAI', 'https://platform.openai.com/api-keys'],
+    ['openai', 'OpenAI (ChatGPT)', 'https://platform.openai.com/api-keys'],
     ['elevenlabs', 'ElevenLabs', 'https://elevenlabs.io/app/settings/api-keys'],
     ['anthropic', 'Claude (Anthropic) — лише для підсумків', 'https://console.anthropic.com/settings/keys']
   ].map(([k, label, url]) => {

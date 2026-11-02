@@ -19,7 +19,7 @@ export const ENGINES = {
     keyUrl: 'https://console.groq.com/keys'
   },
   openai: {
-    id: 'openai', name: 'OpenAI', keyName: 'openai', speakers: true, freeTier: false,
+    id: 'openai', name: 'OpenAI (ChatGPT)', keyName: 'openai', speakers: true, freeTier: false,
     maxBytes: 24e6, maxSec: 1380,
     note: 'Платний. Модель з розділенням спікерів (gpt-4o-transcribe-diarize) OpenAI вимкне 26.02.2027.',
     keyUrl: 'https://platform.openai.com/api-keys'
@@ -34,7 +34,7 @@ export const ENGINES = {
 
 export const ANALYZERS = {
   gemini: { id: 'gemini', name: 'Gemini', keyName: 'gemini', keyUrl: 'https://aistudio.google.com/apikey' },
-  openai: { id: 'openai', name: 'OpenAI', keyName: 'openai', keyUrl: 'https://platform.openai.com/api-keys' },
+  openai: { id: 'openai', name: 'OpenAI (ChatGPT)', keyName: 'openai', keyUrl: 'https://platform.openai.com/api-keys' },
   anthropic: { id: 'anthropic', name: 'Claude', keyName: 'anthropic', keyUrl: 'https://console.anthropic.com/settings/keys' }
 };
 

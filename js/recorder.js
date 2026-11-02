@@ -10,10 +10,11 @@ function pickMime() {
 }
 
 export class Recorder {
-  constructor({ meetingId, onLevel, onState }) {
+  constructor({ meetingId, onLevel, onState, onInterrupted }) {
     this.meetingId = meetingId;
     this.onLevel = onLevel || (() => { });
     this.onState = onState || (() => { });
+    this.onInterrupted = onInterrupted || null;
     this.recId = 'r_' + Date.now();
     this.seq = 0;
     this.chunks = [];
@@ -37,6 +38,10 @@ export class Recorder {
     this.mr = new MediaRecorder(this.stream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
     this.mime = this.mr.mimeType || this.mime || 'audio/webm';
     await idb.put('recMeta', { recId: this.recId, meetingId: this.meetingId, mime: this.mime, startedAt: Date.now(), elapsed: 0 });
+    // Якщо систему чи інший додаток забрав мікрофон — завершуємо запис, щоб записане пішло в обробку.
+    const interrupted = () => { if (this.state !== 'stopped' && this.onInterrupted) this.onInterrupted(); };
+    this.stream.getAudioTracks().forEach(t => t.addEventListener('ended', interrupted));
+    this.mr.onerror = interrupted;
     this.mr.ondataavailable = async (e) => {
       if (!e.data || !e.data.size) return;
       this.chunks.push(e.data);

@@ -339,3 +339,8 @@ details.card .field { margin-bottom: 10px; }
 .toast.ok { background: var(--ok); color: #fff; }
 .toast.err { background: var(--err); color: #fff; }
 .toast.out { opacity: 0; transform: translateY(-8px); }
+
+/* ---------- Затемнення під час запису ---------- */
+.dim { position: fixed; inset: 0; z-index: 100; background: #000; color: #3d3d3d; display: flex; flex-direction: column; align-items: center; padding-top: 35vh; cursor: pointer; transition: padding-top 2s; }
+.dim-clock { font-size: 44px; font-weight: 300; font-variant-numeric: tabular-nums; }
+.dim-hint { font-size: 13px; margin-top: 10px; color: #2e2e2e; }
