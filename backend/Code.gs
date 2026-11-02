@@ -7,12 +7,13 @@
  * Потім: Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
  */
 
-const APP_VERSION = '1.0.1';
-const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник' };
+const APP_VERSION = '1.0.2';
+const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник', series: 'Серії' };
 const M_COLS = ['id', 'eventId', 'title', 'start', 'end', 'participants', 'notes', 'folderId',
   'audioFileId', 'audioName', 'durationSec', 'engines', 'primaryEngine', 'speakerMap',
   'docId', 'status', 'updatedAt'];
 const P_COLS = ['id', 'name', 'role', 'aliases'];
+const S_COLS = ['eventId', 'title', 'participants', 'notes', 'freq', 'until'];
 const DESC_MARK = '\n\n— Наради —\n';
 
 /* ---------- Перше налаштування ---------- */
@@ -39,8 +40,9 @@ function setup() {
   ensureSheet_(ss, SHEETS.meetings, M_COLS);
   ensureSheet_(ss, SHEETS.people, P_COLS);
   ensureSheet_(ss, SHEETS.glossary, ['term']);
+  ensureSheet_(ss, SHEETS.series, S_COLS);
   ss.getSheets().forEach(function (sh) {
-    const known = [SHEETS.meetings, SHEETS.people, SHEETS.glossary].indexOf(sh.getName()) >= 0;
+    const known = [SHEETS.meetings, SHEETS.people, SHEETS.glossary, SHEETS.series].indexOf(sh.getName()) >= 0;
     if (!known && sh.getLastRow() === 0 && ss.getSheets().length > 3) ss.deleteSheet(sh);
   });
 
@@ -286,6 +288,42 @@ function peopleById_() {
   return m;
 }
 
+/* ---------- Серії повторюваних нарад ---------- */
+
+function seriesSheet_() {
+  const ss = SpreadsheetApp.openById(prop_('SHEET_ID'));
+  return ss.getSheetByName(SHEETS.series) || ensureSheet_(ss, SHEETS.series, S_COLS);
+}
+
+function seriesMap_() {
+  const m = {};
+  readTable_(seriesSheet_(), S_COLS).forEach(function (r) { m[r.eventId] = r; });
+  return m;
+}
+
+function saveSeries_(eventId, fields) {
+  const sh = seriesSheet_();
+  const row = readTable_(sh, S_COLS).filter(function (r) { return r.eventId === eventId; })[0] || { eventId: eventId };
+  Object.keys(fields).forEach(function (k) { row[k] = fields[k]; });
+  writeRow_(sh, S_COLS, row);
+}
+
+function buildRecurrence_(rep) {
+  if (!rep.until) throw new Error('Не вказано, до якої дати повторювати');
+  const until = new Date(rep.until);
+  const W = CalendarApp.Weekday;
+  const rec = CalendarApp.newRecurrence();
+  let rule;
+  if (rep.freq === 'weekdays') rule = rec.addWeeklyRule().onlyOnWeekdays([W.MONDAY, W.TUESDAY, W.WEDNESDAY, W.THURSDAY, W.FRIDAY]);
+  else if (rep.freq === 'daily') rule = rec.addDailyRule();
+  else if (rep.freq === 'weekly') rule = rec.addWeeklyRule();
+  else if (rep.freq === 'biweekly') rule = rec.addWeeklyRule().interval(2);
+  else if (rep.freq === 'monthly') rule = rec.addMonthlyRule();
+  else throw new Error('Невідома періодичність: ' + rep.freq);
+  rule.until(until);
+  return rec;
+}
+
 /* ---------- Наради ---------- */
 
 function sameMinute_(iso, date) {
@@ -342,13 +380,20 @@ function listMeetings_(a) {
   const rows = readTable_(sheet_(SHEETS.meetings), M_COLS);
   const used = {};
   const out = [];
+  const series = events.some(function (ev) { return ev.isRecurringEvent(); }) ? seriesMap_() : {};
   events.forEach(function (ev) {
     if (ev.isAllDayEvent()) return;
     const evId = ev.getId(), st = ev.getStartTime();
     let row = rows.filter(function (r) { return r.eventId === evId && sameMinute_(r.start, st); })[0];
     if (!row && !ev.isRecurringEvent()) row = rows.filter(function (r) { return r.eventId === evId && !used[r.id]; })[0];
     if (row) used[row.id] = true;
-    out.push(toMeeting_(row || null, ev));
+    const mt = toMeeting_(row || null, ev);
+    const ser = series[evId];
+    if (!row && ser) {
+      mt.participants = parseJson_(ser.participants, []);
+      if (ser.notes) mt.notes = ser.notes;
+    }
+    out.push(mt);
   });
   rows.forEach(function (r) {
     if (used[r.id] || !r.start) return;
@@ -401,7 +446,19 @@ function saveMeeting_(a) {
     const participants = m.participants || [];
     const cal = getCal_();
     let eventId = m.eventId || row.eventId || '';
-    if (eventId) {
+    if (m.repeat && m.repeat.freq && !m.recurring) {
+      // Нова повторювана нарада або перетворення одиночної на серію.
+      if (eventId) {
+        const old = eventForRow_({ eventId: eventId, start: row.start || m.start });
+        if (old && !old.isRecurringEvent()) old.deleteEvent();
+      }
+      const ser = cal.createEventSeries(m.title, st, en, buildRecurrence_(m.repeat), { description: buildDesc_(m.notes, participants, '') });
+      eventId = ser.getId();
+      saveSeries_(eventId, { title: m.title, participants: JSON.stringify(participants), notes: m.notes || '', freq: m.repeat.freq, until: m.repeat.until });
+    } else if (eventId) {
+      if (m.recurring && m.applyToSeries) {
+        saveSeries_(eventId, { title: m.title, participants: JSON.stringify(participants), notes: m.notes || '' });
+      }
       if (!m.recurring) {
         const ev = eventForRow_({ eventId: eventId, start: row.start || m.start });
         if (ev && !ev.isRecurringEvent()) {

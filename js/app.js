@@ -11,7 +11,7 @@ import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from 
 import { idb, getPrepared } from './store.js';
 import { downloadFile } from './drive.js';
 
-const APP_VERSION = '1.0.2';
+const APP_VERSION = '1.0.3';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -800,6 +800,34 @@ async function viewEdit(id, params) {
   const picker = participantPicker(m ? m.participants : [], people);
   const addCal = h('input', { type: 'checkbox', checked: true });
 
+  // Повторення: для нової наради або одиночної, яку хочемо зробити регулярною.
+  const c = await api.loadConfig().catch(() => null);
+  if (!alive(t)) return;
+  const seriesOk = !!(c && c.info && verGte(c.info.version, '1.0.2'));
+  const canRepeat = !(m && m.recurring);
+  const freq = h('select', { class: 'input', disabled: !seriesOk });
+  const term = h('select', { class: 'input' }, [[1, '1 місяць'], [2, '2 місяці'], [3, '3 місяці'], [6, 'пів року'], [12, 'рік']].map(([v, l]) => h('option', { value: v }, l)));
+  const repInfo = h('p', { class: 'hint' });
+  const termBox = h('label', { class: 'field', hidden: true }, 'На який термін створити', term);
+  const applySeries = h('input', { type: 'checkbox' });
+  const untilDate = () => { const u = new Date(`${date.value}T00:00`); u.setMonth(u.getMonth() + Number(term.value)); u.setHours(23, 59, 59, 0); return u; };
+  const drawRepeat = () => {
+    const d = new Date(`${date.value}T00:00`);
+    const wd = new Intl.DateTimeFormat('uk-UA', { weekday: 'long' }).format(d);
+    const cur = freq.value;
+    clear(freq);
+    put(freq, [['', 'Не повторювати'], ['weekdays', 'Щодня в робочі дні (пн–пт)'], ['daily', 'Щодня'], ['weekly', `Щотижня (${wd})`], ['biweekly', `Раз на 2 тижні (${wd})`], ['monthly', `Щомісяця (${d.getDate()} числа)`]]
+      .map(([v, l]) => h('option', { value: v }, l)));
+    freq.value = cur;
+    const on = !!freq.value;
+    termBox.hidden = !on;
+    addCal.checked = on || addCal.checked; addCal.disabled = on;
+    repInfo.textContent = !seriesOk ? 'Щоб створювати повторювані наради, онови скрипт Google до версії 1.0.2.'
+      : on ? `У Google Календарі зʼявиться серія: ${countOccurrences(freq.value, d, untilDate())} нарад до ${fmtDateFull(untilDate())} включно. Час усієї серії потім змінюють у Google Календарі.` : '';
+  };
+  [date, freq, term].forEach(x => x.addEventListener('change', drawRepeat));
+  drawRepeat();
+
   t1.addEventListener('change', () => {
     const [a, b] = t1.value.split(':').map(Number);
     const [c, d] = t2.value.split(':').map(Number);
@@ -816,6 +844,8 @@ async function viewEdit(id, params) {
       const payload = { ...(m || {}), title: title.value.trim(), start: s.toISOString(), end: en.toISOString(), notes: notes.value, participants: picker.get() };
       if (lockTime) { payload.start = m.start; payload.end = m.end; }
       if (!m) payload.addToCalendar = addCal.checked;
+      if (canRepeat && freq.value) payload.repeat = { freq: freq.value, until: untilDate().toISOString() };
+      if (m && m.recurring && applySeries.checked) payload.applyToSeries = true;
       const r = await api.call('saveMeeting', { meeting: payload });
       S.meetings.set(r.id, r);
       toast('Збережено', 'ok');
@@ -829,10 +859,42 @@ async function viewEdit(id, params) {
       h('label', { class: 'field' }, 'Назва', title),
       h('div', { class: 'grid3' }, h('label', { class: 'field' }, 'Дата', date), h('label', { class: 'field' }, 'Початок', t1), h('label', { class: 'field' }, 'Кінець', t2)),
       lockTime ? h('p', { class: 'hint' }, 'Це повторювана подія — час змінюй у Google Календарі.') : null,
+      canRepeat ? h('label', { class: 'field' }, 'Повторювати', freq) : null,
+      canRepeat ? termBox : null,
+      canRepeat ? repInfo : null,
       h('div', { class: 'field' }, 'Учасники', picker.el),
       h('label', { class: 'field' }, 'Нотатки', notes),
+      m && m.recurring ? h('label', { class: 'check' }, applySeries, ' Застосувати учасників і нотатки до всієї серії') : null,
+      m && m.recurring ? h('p', { class: 'hint' }, 'Наради серії, які ти вже записував чи змінював окремо, лишаться як є.') : null,
       !m ? h('label', { class: 'check' }, addCal, ' Додати в Google Календар') : null,
       h('div', { class: 'row' }, btn, h('button', { type: 'button', class: 'btn ghost', onclick: () => history.back() }, 'Скасувати'))));
+}
+
+function verGte(v, min) {
+  const a = String(v || '0').split('.').map(Number), b = String(min).split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0); }
+  return true;
+}
+
+// Скільки нарад вийде в серії — для підказки у формі (так само рахує Google Календар).
+function countOccurrences(freq, start, until) {
+  const s0 = new Date(start);
+  let n = 0;
+  if (freq === 'monthly') {
+    // Як у Google Календарі: місяці, де немає такого числа (напр. 31-го), пропускаються.
+    for (let k = 0; k < 400; k++) {
+      const d = new Date(s0.getFullYear(), s0.getMonth() + k, s0.getDate());
+      if (new Date(s0.getFullYear(), s0.getMonth() + k, 1) > until) break;
+      if (d.getDate() === s0.getDate() && d <= until) n++;
+    }
+    return n;
+  }
+  const step = freq === 'weekly' ? 7 : freq === 'biweekly' ? 14 : 1;
+  for (let d = s0, g = 0; d <= until && g < 800; d = addDays(d, step), g++) {
+    const wd = d.getDay();
+    if (freq !== 'weekdays' || (wd >= 1 && wd <= 5)) n++;
+  }
+  return n;
 }
 
 /* =================== Запис =================== */
@@ -1169,6 +1231,7 @@ function connSection(c) {
     info ? h('div', { class: 'stack tight' },
       h('div', null, 'Акаунт: ', h('b', null, info.email || '—')),
       h('div', null, 'Календар: ', h('b', null, info.calendarName)),
+      h('div', null, 'Скрипт Google: ', h('b', null, 'версія ' + (info.version || '—'))),
       h('div', { class: 'row wrap' },
         h('a', { class: 'btn small', href: info.folderUrl, target: '_blank', rel: 'noopener' }, icon('open'), 'Папка на Диску'),
         h('a', { class: 'btn small', href: info.sheetUrl, target: '_blank', rel: 'noopener' }, icon('open'), 'Таблиця нарад'))) : null,
