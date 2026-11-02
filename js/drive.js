@@ -28,6 +28,9 @@ export async function uploadBlob(blob, name, meetingId, onProgress) {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', url);
     xhr.setRequestHeader('Content-Type', type);
+    // Не чекаємо вічно, якщо мережа «застигла»: щонайменше 3 хв, для великих файлів — з розрахунку 30 КБ/с.
+    xhr.timeout = Math.max(180000, Math.round(blob.size / 30));
+    xhr.ontimeout = () => reject(new Error('Завантаження на Google Диск зависло. Перевір інтернет і спробуй ще раз — запис збережено на пристрої.'));
     xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) { try { resolve(JSON.parse(xhr.responseText)); } catch { reject(new Error('Незрозуміла відповідь Диска')); } }

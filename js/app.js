@@ -13,7 +13,7 @@ import { downloadFile } from './drive.js';
 import { taskCard, editTask, sortTasks, isOverdue, weeklyReport, tasksText as tasksListText } from './tasks.js';
 import { syncIndex, searchAll, queryWords, snippet, highlight } from './search.js';
 
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -735,23 +735,50 @@ function seek(sec) {
 function jobPanel(meetingId, onFinished) {
   const box = h('div', { class: 'job card' });
   let wasRunning = !!(jobFor(meetingId) && jobFor(meetingId).running);
+  let resumedNote = false;
   const icons = { ok: '✓', err: '!', run: '', wait: '·' };
+  const took = (s) => {
+    if (!s.startedAt) return '';
+    const sec = ((s.endedAt || Date.now()) - s.startedAt) / 1000;
+    return sec >= 1 ? fmtDuration(sec) : '';
+  };
   const draw = () => {
     const j = jobFor(meetingId);
     clear(box);
     box.hidden = !j;
     if (!j) return;
-    put(box, 
+    put(box,
       h('div', { class: 'job-head' }, j.running ? h('span', { class: 'spin' }) : null,
         h('b', null, j.running ? 'Обробка…' : j.error ? 'Обробку зупинено' : 'Готово'),
         !j.running ? h('button', { class: 'btn small ghost', onclick: () => clearJob(meetingId) }, 'Сховати') : null),
-      h('ul', { class: 'steps' }, j.steps.map(s => h('li', { class: 'step ' + s.status },
+      h('ul', { class: 'steps' }, j.steps.map(s => h('li', { class: 'step ' + s.status, dataset: { sid: s.id } },
         h('span', { class: 'st-ic' }, icons[s.status]),
-        h('div', { class: 'grow' }, h('div', null, s.label), s.detail ? h('div', { class: 'hint' }, s.detail) : null,
-          s.progress != null ? h('div', { class: 'bar' }, h('i', { style: { width: Math.round(s.progress * 100) + '%' } })) : null)))),
-      j.running ? h('p', { class: 'hint' }, 'Не закривай додаток до завершення — екран лишатиметься увімкненим.') : null);
+        h('div', { class: 'grow' },
+          h('div', { class: 'row between' }, h('span', null, s.label), h('span', { class: 'hint st-time' }, took(s))),
+          s.detail ? h('div', { class: 'hint' }, s.detail) : null,
+          s.progress != null ? h('div', { class: 'bar' }, h('i', { style: { width: Math.round(s.progress * 100) + '%' } })) : null,
+          s.status === 'run' && j.canSkip(s.id) && s.startedAt && Date.now() - s.startedAt > 45000
+            ? h('button', { class: 'btn small ghost skip', onclick: () => j.skip(s.id) }, 'Пропустити — не чекати цей двигун') : null)))),
+      j.running && resumedNote ? h('div', { class: 'banner warn small' }, 'Поки додаток був згорнутий, Android міг призупинити обробку. Тримай «Наради» відкритими до кінця — екран не гасне сам.') : null,
+      j.running ? h('p', { class: 'hint' }, 'Не закривай і не згортай додаток до завершення — екран лишатиметься увімкненим.') : null);
   };
+  // Щосекунди оновлюємо лише час кроків (повне перемальовування заважало б натискати кнопки).
+  const tick = setInterval(() => {
+    if (!box.isConnected) { clearInterval(tick); return; }
+    const j = jobFor(meetingId);
+    if (!j || !j.running) return;
+    let redraw = false;
+    for (const st of j.steps) {
+      const li = box.querySelector(`li[data-sid="${st.id}"]`);
+      if (!li) { redraw = true; break; }
+      const tm = li.querySelector('.st-time');
+      if (tm) tm.textContent = took(st);
+      if (st.status === 'run' && j.canSkip(st.id) && st.startedAt && Date.now() - st.startedAt > 45000 && !li.querySelector('.skip')) redraw = true;
+    }
+    if (redraw) draw();
+  }, 1000);
   const off = onJobs((id) => {
+    if (id === '__resumed') { if (jobFor(meetingId) && jobFor(meetingId).running) { resumedNote = true; draw(); } return; }
     if (id !== meetingId) return;
     if (!box.isConnected) { off(); return; }
     draw();

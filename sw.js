@@ -1,6 +1,6 @@
 // Service worker: офлайн-кеш оболонки додатку і прийом файлів через «Поділитися» на Android.
 
-const VERSION = 'narady-1.1.1';
+const VERSION = 'narady-1.1.2';
 const ASSETS = [
   './', './index.html', './app.css', './manifest.webmanifest',
   './js/app.js', './js/ui.js', './js/api.js', './js/store.js', './js/audio.js', './js/mp3worker.js',

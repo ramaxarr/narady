@@ -19,7 +19,17 @@ function emit(id) { for (const fn of listeners) { try { fn(id, jobs.get(id)); } 
 let wake = null;
 async function holdWake() { try { if (!wake && 'wakeLock' in navigator) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => { wake = null; }); } } catch { } }
 function releaseWake() { if (!anyJobRunning() && wake) { try { wake.release(); } catch { } wake = null; } }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && anyJobRunning()) holdWake(); });
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { hiddenAt = anyJobRunning() ? Date.now() : 0; return; }
+  if (anyJobRunning()) {
+    holdWake();
+    if (hiddenAt && Date.now() - hiddenAt > 20000) {
+      for (const fn of listeners) { try { fn('__resumed', null); } catch { } }
+    }
+  }
+  hiddenAt = 0;
+});
 
 class Job {
   constructor(meetingId) {
@@ -33,7 +43,17 @@ class Job {
     emit(meetingId);
   }
   add(id, label) { this.steps.push({ id, label, status: 'wait', detail: '', progress: null }); emit(this.meetingId); }
-  set(id, patch) { const s = this.steps.find(x => x.id === id); if (s) Object.assign(s, patch); emit(this.meetingId); }
+  set(id, patch) {
+    const s = this.steps.find(x => x.id === id);
+    if (!s) return;
+    if (patch.status === 'run' && !s.startedAt) s.startedAt = Date.now();
+    if ((patch.status === 'ok' || patch.status === 'err') && s.startedAt && !s.endedAt) s.endedAt = Date.now();
+    Object.assign(s, patch);
+    emit(this.meetingId);
+  }
+  // Повільний двигун можна пропустити — решта й підсумок не чекатимуть на нього.
+  skip(id) { const c = this.controls && this.controls[id]; if (c) c.abort(); }
+  canSkip(id) { return !!(this.controls && this.controls[id] && !this.controls[id].signal.aborted); }
   finish(err) {
     this.running = false; this.error = err || null;
     emit(this.meetingId);
@@ -157,18 +177,23 @@ async function runEngines(meeting, prepared, engines, job, analyzeAfter) {
   for (const id of engines) job.add('eng_' + id, 'Розпізнавання: ' + ENGINES[id].name);
   let latest = meeting;
   const results = {};
+  job.controls = {};
   await Promise.all(engines.map(async (id) => {
     const sid = 'eng_' + id;
+    const ctrl = new AbortController();
+    job.controls[sid] = ctrl;
     job.set(sid, { status: 'run' });
     try {
-      const ectx = { ...ctx, onStatus: (t) => job.set(sid, { detail: t }) };
+      const ectx = { ...ctx, signal: ctrl.signal, onStatus: (t) => job.set(sid, { detail: t }) };
       const tr = await transcribe(id, prepared, ectx, (i, n) => job.set(sid, { detail: n > 1 ? `частина ${i + 1} з ${n}` : 'обробка…' }));
       latest = await call('saveTranscript', { meetingId: meeting.id, engine: id, transcript: tr });
       results[id] = tr;
       const words = tr.text.split(/\s+/).filter(Boolean).length;
       job.set(sid, { status: 'ok', detail: `${words} слів, ${tr.elapsedSec} с${tr.warnings.length ? ' · ' + tr.warnings[0] : ''}` });
     } catch (e) {
-      job.set(sid, { status: 'err', detail: e.message });
+      job.set(sid, { status: 'err', detail: e.skipped ? 'пропущено — можна запустити пізніше через «Розпізнати…»' : e.message });
+    } finally {
+      delete job.controls[sid];
     }
   }));
   if (!Object.keys(results).length) throw new Error('Жоден двигун не впорався');

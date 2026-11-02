@@ -44,10 +44,16 @@ const ERRORS = {
 export async function call(action, args = {}, conn = getConn()) {
   if (!conn || !conn.url) throw new ApiError('no_conn', 'Додаток не підключено до бекенду');
   let res;
+  // Скрипт Google працює не довше 6 хв — довше чекати немає сенсу.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 380000);
   try {
-    res = await fetch(conn.url, { method: 'POST', body: JSON.stringify({ token: conn.token, action, args }), redirect: 'follow' });
+    res = await fetch(conn.url, { method: 'POST', body: JSON.stringify({ token: conn.token, action, args }), redirect: 'follow', signal: ctrl.signal });
   } catch (e) {
+    if (e.name === 'AbortError') throw new ApiError('timeout', 'Скрипт Google не відповів. Спробуй ще раз.');
     throw new ApiError('network', navigator.onLine ? 'Не вдалося звʼязатися з бекендом. Перевір адресу скрипта.' : 'Немає інтернету');
+  } finally {
+    clearTimeout(timer);
   }
   const text = await res.text();
   let data;

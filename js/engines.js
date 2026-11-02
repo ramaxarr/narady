@@ -40,9 +40,18 @@ export const ANALYZERS = {
 
 /* ---------- HTTP з запасним шляхом через бекенд ---------- */
 
-async function httpPost(url, { headers = {}, json, form, timeoutMs = 20 * 60 * 1000 }) {
+// Скільки чекати відповіді: для хвилинного запису ~2 хв, для 20-хвилинного шматка ~7,5 хв, максимум 15 хв.
+export const pieceTimeout = (sec) => Math.round(Math.min(15 * 60, 90 + (sec || 60) * 0.3) * 1000);
+
+function skipError() { const e = new Error('Пропущено'); e.skipped = true; return e; }
+
+async function httpPost(url, { headers = {}, json, form, timeoutMs = 120000, signal }) {
+  if (signal && signal.aborted) throw skipError();
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+  const onAbort = () => ctrl.abort();
+  if (signal) signal.addEventListener('abort', onAbort, { once: true });
   try {
     let body, h = { ...headers };
     if (json !== undefined) { body = JSON.stringify(json); h['Content-Type'] = 'application/json'; }
@@ -56,7 +65,12 @@ async function httpPost(url, { headers = {}, json, form, timeoutMs = 20 * 60 * 1
     const res = await fetch(url, { method: 'POST', headers: h, body, signal: ctrl.signal });
     return { status: res.status, text: await res.text(), via: 'direct' };
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Сервіс не відповів за відведений час');
+    if (signal && signal.aborted) throw skipError();
+    if (e.name === 'AbortError' || timedOut) {
+      const err = new Error(`сервіс не відповів за ${Math.max(1, Math.round(timeoutMs / 60000))} хв`);
+      err.timeout = true;
+      throw err;
+    }
     if (!(e instanceof TypeError) || !navigator.onLine) throw e;
     // Браузер не пустив запит (найчастіше — CORS). Пробуємо через бекенд.
     let pform;
@@ -67,24 +81,39 @@ async function httpPost(url, { headers = {}, json, form, timeoutMs = 20 * 60 * 1
         else pform.push({ name: f.name, value: f.value });
       }
     }
-    const r = await call('proxy', { url, headers, json, form: pform });
-    return { ...r, via: 'proxy' };
+    const viaProxy = call('proxy', { url, headers, json, form: pform }).then(r => ({ ...r, via: 'proxy' }));
+    if (!signal) return await viaProxy;
+    return await Promise.race([viaProxy, new Promise((_, rej) => signal.addEventListener('abort', () => rej(skipError()), { once: true }))]);
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
-// Тимчасові відмови (перевантаження, ліміт за хвилину) пробуємо ще тричі з паузами.
+// Тимчасові відмови (перевантаження, ліміт за хвилину) пробуємо ще тричі з паузами; завислий запит — ще раз один.
 const RETRY_STATUS = [429, 500, 502, 503, 504];
 export const RETRY_DELAYS = [10, 20, 40];
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function post(ctx, name, url, opts) {
+  let timeouts = 0;
   for (let attempt = 0; ; attempt++) {
-    const r = await httpPost(url, opts);
+    let r;
+    try {
+      r = await httpPost(url, { ...opts, signal: ctx.signal });
+    } catch (e) {
+      if (e.timeout && timeouts < 1) {
+        timeouts++;
+        if (ctx.onStatus) ctx.onStatus(`${name}: ${e.message}, пробую ще раз…`);
+        continue;
+      }
+      if (e.timeout) e.message = `${name}: ${e.message}. Спробуй пізніше або інший двигун.`;
+      throw e;
+    }
     if (!RETRY_STATUS.includes(r.status) || attempt >= RETRY_DELAYS.length) return r;
     const total = RETRY_DELAYS.length + 1;
     for (let s = RETRY_DELAYS[attempt]; s > 0; s--) {
+      if (ctx.signal && ctx.signal.aborted) throw skipError();
       if (ctx.onStatus) ctx.onStatus(`${name} перевантажений (${r.status}), повтор через ${s} с — спроба ${attempt + 2} з ${total}`);
       await sleep(1000);
     }
@@ -226,7 +255,7 @@ async function geminiTranscribe(audio, ctx, onProgress) {
     };
     if (/2\.5-flash/.test(model)) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
     const r = await post(ctx, 'Gemini', `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      { headers: { 'x-goog-api-key': key }, json: body });
+      { headers: { 'x-goog-api-key': key }, json: body, timeoutMs: pieceTimeout(p.duration) });
     if (r.status !== 200) throw apiError('Gemini', r);
     const data = JSON.parse(r.text);
     const cand = (data.candidates || [])[0];
@@ -265,7 +294,7 @@ async function groqTranscribe(audio, ctx, onProgress) {
     ];
     if (ctx.settings.language === 'uk') form.push({ name: 'language', value: 'uk' });
     if (prompt) form.push({ name: 'prompt', value: prompt });
-    const r = await post(ctx, 'Groq', 'https://api.groq.com/openai/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
+    const r = await post(ctx, 'Groq', 'https://api.groq.com/openai/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form, timeoutMs: pieceTimeout(p.duration) });
     if (r.status !== 200) throw apiError('Groq', r);
     const j = JSON.parse(r.text);
     for (const s of j.segments || []) {
@@ -298,9 +327,9 @@ async function openaiTranscribe(audio, ctx, onProgress) {
       if (kw.length) form.push({ name: 'prompt', value: 'Робоча нарада на виробництві. Назви й імена: ' + kw.join(', ') });
     }
     const withLang = ctx.settings.language === 'uk' ? [...form, { name: diarize ? 'language' : 'languages[]', value: 'uk' }] : form;
-    let r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form: withLang });
+    let r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form: withLang, timeoutMs: pieceTimeout(p.duration) });
     if (r.status === 400 && withLang !== form && /language/i.test(r.text)) {
-      r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
+      r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form, timeoutMs: pieceTimeout(p.duration) });
     }
     if (r.status !== 200) throw apiError('OpenAI', r);
     const j = JSON.parse(r.text);
@@ -350,10 +379,10 @@ async function elevenTranscribe(audio, ctx, onProgress) {
     if (ctx.settings.language === 'uk') form.push({ name: 'language_code', value: 'uk' });
     const terms = hintTerms(ctx, 100).filter(t => t.length <= 50);
     const withTerms = [...form, ...terms.map(t => ({ name: 'keyterms', value: t }))];
-    let r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form: terms.length ? withTerms : form });
+    let r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form: terms.length ? withTerms : form, timeoutMs: pieceTimeout(p.duration) });
     if (terms.length && (r.status === 400 || r.status === 422)) {
       warnings.push('Словник не прийнято сервісом, розпізнано без нього.');
-      r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form });
+      r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form, timeoutMs: pieceTimeout(p.duration) });
     }
     if (r.status !== 200) throw apiError('ElevenLabs', r);
     const j = JSON.parse(r.text);
@@ -481,20 +510,20 @@ export async function analyze(tr, meta, ctx) {
       generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: ANALYSIS_SCHEMA, maxOutputTokens: 16384 }
     };
     const r = await post(ctx, 'Gemini', `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      { headers: { 'x-goog-api-key': key }, json: body });
+      { headers: { 'x-goog-api-key': key }, json: body, timeoutMs: 180000 });
     if (r.status !== 200) throw apiError('Gemini', r);
     const d = JSON.parse(r.text);
     text = (((d.candidates || [])[0] || {}).content?.parts || []).map(x => x.text || '').join('');
   } else if (engine === 'openai') {
     const r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/chat/completions', {
-      headers: { Authorization: 'Bearer ' + key },
+      headers: { Authorization: 'Bearer ' + key }, timeoutMs: 180000,
       json: { model, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }
     });
     if (r.status !== 200) throw apiError('OpenAI', r);
     text = JSON.parse(r.text).choices?.[0]?.message?.content || '';
   } else if (engine === 'anthropic') {
     const r = await post(ctx, 'Claude', 'https://api.anthropic.com/v1/messages', {
-      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }, timeoutMs: 180000,
       json: { model, max_tokens: 8000, messages: [{ role: 'user', content: prompt }] }
     });
     if (r.status !== 200) throw apiError('Claude', r);
