@@ -56,7 +56,11 @@ export async function call(action, args = {}, conn = getConn()) {
     throw new ApiError('bad_response', 'Незрозуміла відповідь бекенду');
   }
   if (!data.ok) throw new ApiError(data.error, ERRORS[data.error] || data.error);
-  return data.data;
+  // Лише getMeeting і listMeetings справді звіряють нараду з календарем;
+  // у відповідях на збереження прапорець «подію видалено» хибний, тож прибираємо його.
+  const d = data.data;
+  if (d && typeof d === 'object' && !Array.isArray(d) && 'eventMissing' in d && action !== 'getMeeting') d.eventMissing = false;
+  return d;
 }
 
 let config = null;

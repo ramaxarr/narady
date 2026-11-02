@@ -74,6 +74,24 @@ async function httpPost(url, { headers = {}, json, form, timeoutMs = 20 * 60 * 1
   }
 }
 
+// Тимчасові відмови (перевантаження, ліміт за хвилину) пробуємо ще тричі з паузами.
+const RETRY_STATUS = [429, 500, 502, 503, 504];
+export const RETRY_DELAYS = [10, 20, 40];
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function post(ctx, name, url, opts) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await httpPost(url, opts);
+    if (!RETRY_STATUS.includes(r.status) || attempt >= RETRY_DELAYS.length) return r;
+    const total = RETRY_DELAYS.length + 1;
+    for (let s = RETRY_DELAYS[attempt]; s > 0; s--) {
+      if (ctx.onStatus) ctx.onStatus(`${name} перевантажений (${r.status}), повтор через ${s} с — спроба ${attempt + 2} з ${total}`);
+      await sleep(1000);
+    }
+    if (ctx.onStatus) ctx.onStatus(`${name}: спроба ${attempt + 2} з ${total}…`);
+  }
+}
+
 function apiError(name, r) {
   let msg = r.text || '';
   try {
@@ -81,7 +99,10 @@ function apiError(name, r) {
     msg = (j.error && (j.error.message || j.error.type || JSON.stringify(j.error))) || j.detail?.message || (typeof j.detail === 'string' ? j.detail : '') || j.message || msg;
     if (typeof msg !== 'string') msg = JSON.stringify(msg);
   } catch { }
-  const hint = r.status === 401 || r.status === 403 ? ' Перевір ключ API в Налаштуваннях.' : r.status === 429 ? ' Перевищено ліміт — спробуй трохи пізніше.' : '';
+  const busy = [500, 502, 503, 504].includes(r.status);
+  const hint = r.status === 401 || r.status === 403 ? ' Перевір ключ API в Налаштуваннях.'
+    : r.status === 429 ? ' Перевищено ліміт — спробуй трохи пізніше.'
+    : busy ? ` Сервіс тимчасово перевантажений і не відповів після ${RETRY_DELAYS.length + 1} спроб. Натисни «Розпізнати…» ще раз за кілька хвилин або обери інший двигун.` : '';
   const e = new Error(`${name}: помилка ${r.status}. ${String(msg).slice(0, 300)}${hint}`);
   e.status = r.status; e.body = msg;
   return e;
@@ -204,7 +225,7 @@ async function geminiTranscribe(audio, ctx, onProgress) {
       generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SEG_SCHEMA, maxOutputTokens: 65536 }
     };
     if (/2\.5-flash/.test(model)) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
-    const r = await httpPost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    const r = await post(ctx, 'Gemini', `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       { headers: { 'x-goog-api-key': key }, json: body });
     if (r.status !== 200) throw apiError('Gemini', r);
     const data = JSON.parse(r.text);
@@ -244,7 +265,7 @@ async function groqTranscribe(audio, ctx, onProgress) {
     ];
     if (ctx.settings.language === 'uk') form.push({ name: 'language', value: 'uk' });
     if (prompt) form.push({ name: 'prompt', value: prompt });
-    const r = await httpPost('https://api.groq.com/openai/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
+    const r = await post(ctx, 'Groq', 'https://api.groq.com/openai/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
     if (r.status !== 200) throw apiError('Groq', r);
     const j = JSON.parse(r.text);
     for (const s of j.segments || []) {
@@ -277,9 +298,9 @@ async function openaiTranscribe(audio, ctx, onProgress) {
       if (kw.length) form.push({ name: 'prompt', value: 'Робоча нарада на виробництві. Назви й імена: ' + kw.join(', ') });
     }
     const withLang = ctx.settings.language === 'uk' ? [...form, { name: diarize ? 'language' : 'languages[]', value: 'uk' }] : form;
-    let r = await httpPost('https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form: withLang });
+    let r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form: withLang });
     if (r.status === 400 && withLang !== form && /language/i.test(r.text)) {
-      r = await httpPost('https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
+      r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/audio/transcriptions', { headers: { Authorization: 'Bearer ' + key }, form });
     }
     if (r.status !== 200) throw apiError('OpenAI', r);
     const j = JSON.parse(r.text);
@@ -329,10 +350,10 @@ async function elevenTranscribe(audio, ctx, onProgress) {
     if (ctx.settings.language === 'uk') form.push({ name: 'language_code', value: 'uk' });
     const terms = hintTerms(ctx, 100).filter(t => t.length <= 50);
     const withTerms = [...form, ...terms.map(t => ({ name: 'keyterms', value: t }))];
-    let r = await httpPost('https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form: terms.length ? withTerms : form });
+    let r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form: terms.length ? withTerms : form });
     if (terms.length && (r.status === 400 || r.status === 422)) {
       warnings.push('Словник не прийнято сервісом, розпізнано без нього.');
-      r = await httpPost('https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form });
+      r = await post(ctx, 'ElevenLabs', 'https://api.elevenlabs.io/v1/speech-to-text', { headers: { 'xi-api-key': key }, form });
     }
     if (r.status !== 200) throw apiError('ElevenLabs', r);
     const j = JSON.parse(r.text);
@@ -454,20 +475,20 @@ export async function analyze(tr, meta, ctx) {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: ANALYSIS_SCHEMA, maxOutputTokens: 16384 }
     };
-    const r = await httpPost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    const r = await post(ctx, 'Gemini', `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       { headers: { 'x-goog-api-key': key }, json: body });
     if (r.status !== 200) throw apiError('Gemini', r);
     const d = JSON.parse(r.text);
     text = (((d.candidates || [])[0] || {}).content?.parts || []).map(x => x.text || '').join('');
   } else if (engine === 'openai') {
-    const r = await httpPost('https://api.openai.com/v1/chat/completions', {
+    const r = await post(ctx, 'OpenAI', 'https://api.openai.com/v1/chat/completions', {
       headers: { Authorization: 'Bearer ' + key },
       json: { model, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }
     });
     if (r.status !== 200) throw apiError('OpenAI', r);
     text = JSON.parse(r.text).choices?.[0]?.message?.content || '';
   } else if (engine === 'anthropic') {
-    const r = await httpPost('https://api.anthropic.com/v1/messages', {
+    const r = await post(ctx, 'Claude', 'https://api.anthropic.com/v1/messages', {
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
       json: { model, max_tokens: 8000, messages: [{ role: 'user', content: prompt }] }
     });

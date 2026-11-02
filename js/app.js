@@ -11,7 +11,7 @@ import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from 
 import { idb, getPrepared } from './store.js';
 import { downloadFile } from './drive.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),

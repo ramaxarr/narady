@@ -161,7 +161,8 @@ async function runEngines(meeting, prepared, engines, job, analyzeAfter) {
     const sid = 'eng_' + id;
     job.set(sid, { status: 'run' });
     try {
-      const tr = await transcribe(id, prepared, ctx, (i, n) => job.set(sid, { detail: n > 1 ? `частина ${i + 1} з ${n}` : 'обробка…' }));
+      const ectx = { ...ctx, onStatus: (t) => job.set(sid, { detail: t }) };
+      const tr = await transcribe(id, prepared, ectx, (i, n) => job.set(sid, { detail: n > 1 ? `частина ${i + 1} з ${n}` : 'обробка…' }));
       latest = await call('saveTranscript', { meetingId: meeting.id, engine: id, transcript: tr });
       results[id] = tr;
       const words = tr.text.split(/\s+/).filter(Boolean).length;
@@ -199,6 +200,7 @@ async function analyzeStep(meeting, transcripts, job, engineOverride) {
   ctx.nameOf = speakerNamer(meeting, primary, ctx.people);
   job.add('an', 'Підсумок і задачі');
   job.set('an', { status: 'run' });
+  ctx.onStatus = (t) => job.set('an', { detail: t });
   const d = new Date(meeting.start);
   const analysis = await analyze(transcripts[primary], { title: meeting.title, dateText: `${fmtDateFull(d)}, ${fmtTime(d)}` }, ctx);
   let m = await call('saveAnalysis', { meetingId: meeting.id, analysis });
