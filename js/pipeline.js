@@ -6,7 +6,7 @@ import { uploadBlob, downloadFile } from './drive.js';
 import { call, loadConfig, getPeople, getGlossary } from './api.js';
 import { transcribe, analyze, ENGINES } from './engines.js';
 import { savePrepared, getPrepared, trimPrepared } from './store.js';
-import { fmtDateFull, fmtTime } from './ui.js';
+import { fmtDateFull, fmtTime, ymd } from './ui.js';
 
 const jobs = new Map();
 const listeners = new Set();
@@ -201,10 +201,12 @@ async function analyzeStep(meeting, transcripts, job, engineOverride) {
   job.add('an', 'Підсумок і задачі');
   job.set('an', { status: 'run' });
   ctx.onStatus = (t) => job.set('an', { detail: t });
+  try { ctx.carryTasks = await call('carriedTasks', { meetingId: meeting.id }); } catch { ctx.carryTasks = []; }
   const d = new Date(meeting.start);
-  const analysis = await analyze(transcripts[primary], { title: meeting.title, dateText: `${fmtDateFull(d)}, ${fmtTime(d)}` }, ctx);
+  const meta = { title: meeting.title, dateText: `${fmtDateFull(d)}, ${fmtTime(d)}`, dateISO: ymd(d), weekday: new Intl.DateTimeFormat('uk-UA', { weekday: 'long' }).format(d) };
+  const analysis = await analyze(transcripts[primary], meta, ctx);
   let m = await call('saveAnalysis', { meetingId: meeting.id, analysis });
-  job.set('an', { status: 'ok', detail: `${analysis.tasks.length} задач, ${analysis.decisions.length} рішень` });
+  job.set('an', { status: 'ok', detail: `${analysis.tasks.length} задач, ${analysis.decisions.length} рішень${analysis.reportedDone.length ? `, ${analysis.reportedDone.length} з минулих — схоже, виконано` : ''}` });
   if (ctx.settings.autoDoc) {
     job.add('doc', 'Google Doc');
     job.set('doc', { status: 'run' });

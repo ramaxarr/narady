@@ -10,8 +10,10 @@ import { processAudio, runTranscription, runAnalysis, onJobs, jobFor, clearJob, 
 import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from './recorder.js';
 import { idb, getPrepared } from './store.js';
 import { downloadFile } from './drive.js';
+import { taskCard, editTask, sortTasks, isOverdue, weeklyReport, tasksText as tasksListText } from './tasks.js';
+import { syncIndex, searchAll, queryWords, snippet, highlight } from './search.js';
 
-const APP_VERSION = '1.0.3';
+const APP_VERSION = '1.1.0';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -33,7 +35,8 @@ const routes = [
   [/^#\/connect$/, viewConnect],
   [/^#\/new(?:\?(.*))?$/, (q) => viewEdit(null, new URLSearchParams(q || ''))],
   [/^#\/edit\/([^?]+)$/, (id) => viewEdit(decodeURIComponent(id))],
-  [/^#\/m\/([^?]+)$/, (id) => viewMeeting(decodeURIComponent(id))],
+  [/^#\/m\/([^?]+)(?:\?(.*))?$/, (id, q) => viewMeeting(decodeURIComponent(id), new URLSearchParams(q || ''))],
+  [/^#\/tasks$/, viewTasks],
   [/^#\/ev\/([^?]+)$/, (key) => viewMeetingEv(decodeURIComponent(key))],
   [/^#\/rec\/([^?]+)$/, (id) => viewRecord(decodeURIComponent(id))],
   [/^#\/import$/, viewImport]
@@ -69,7 +72,7 @@ async function render() {
 }
 
 function setNav(hash) {
-  const sec = hash.startsWith('#/recordings') ? 'recordings' : hash.startsWith('#/people') ? 'people'
+  const sec = hash.startsWith('#/recordings') ? 'recordings' : hash.startsWith('#/tasks') ? 'tasks' : hash.startsWith('#/people') ? 'people'
     : hash.startsWith('#/settings') || hash.startsWith('#/connect') ? 'settings' : 'calendar';
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.sec === sec));
   updateRecPill();
@@ -239,8 +242,10 @@ async function recoverRecording(r) {
 async function viewRecordings() {
   const t = seq;
   view.appendChild(topbar('Записи'));
-  const search = h('input', { type: 'search', class: 'input', placeholder: 'Пошук за назвою…' });
-  view.appendChild(h('div', { class: 'pad' }, search));
+  const full = backendAtLeast('1.1.0');
+  const search = h('input', { type: 'search', class: 'input', placeholder: full ? 'Пошук у назвах і текстах нарад…' : 'Пошук за назвою…', value: S.searchQ || '' });
+  const status = h('p', { class: 'hint' });
+  view.appendChild(h('div', { class: 'pad' }, search, status));
   const list = h('div', { class: 'stack' }, spinner());
   view.appendChild(list);
   const now = new Date();
@@ -251,15 +256,56 @@ async function viewRecordings() {
   if (!alive(t)) return;
   items.reverse();
   items.forEach(m => S.meetings.set(m.id, m));
-  const draw = () => {
+  let ready = false, drawSeq = 0;
+  const draw = async () => {
+    const my = ++drawSeq;
+    const raw = search.value.trim();
+    S.searchQ = raw;
+    const q = raw.toLowerCase();
+    if (full && ready && queryWords(raw).length) {
+      const res = await searchAll(raw, api.peopleSync());
+      if (my !== drawSeq || !alive(t)) return;
+      clear(list);
+      if (!res.length) { put(list, h('div', { class: 'empty' }, 'Нічого не знайдено')); return; }
+      const words = queryWords(raw);
+      const hitsTotal = res.reduce((n, r) => n + r.hits.length, 0);
+      put(list, h('p', { class: 'hint' }, `Нарад: ${res.length}, збігів у текстах: ${hitsTotal}`));
+      res.forEach(r => put(list, searchResultCard(r, words, raw)));
+      return;
+    }
     clear(list);
-    const q = search.value.trim().toLowerCase();
     const shown = items.filter(m => !q || (m.title || '').toLowerCase().includes(q));
-    if (!shown.length) { list.appendChild(h('div', { class: 'empty' }, q ? 'Нічого не знайдено' : 'Записів ще немає. Запиши нараду або завантаж файл з диктофона.')); return; }
+    if (!shown.length) { put(list, h('div', { class: 'empty' }, q ? 'Нічого не знайдено' : 'Записів ще немає. Запиши нараду або завантаж файл з диктофона.')); return; }
     shown.forEach(m => list.appendChild(meetingCard(m, { showDate: true })));
   };
-  search.addEventListener('input', draw);
+  let timer = null;
+  search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(draw, 200); });
   draw();
+  if (full) {
+    status.textContent = 'Готую пошук по текстах…';
+    syncIndex((n) => { if (alive(t) && n) status.textContent = `Завантажую тексти для пошуку: ${n}…`; })
+      .then(() => { if (!alive(t)) return; ready = true; status.textContent = ''; if (search.value.trim()) draw(); })
+      .catch((e) => { if (alive(t)) status.textContent = 'Пошук по текстах зараз недоступний: ' + e.message; });
+  } else {
+    status.textContent = 'Пошук по текстах зʼявиться після оновлення скрипта Google до версії 1.1.0.';
+  }
+}
+
+function searchResultCard(r, words, raw) {
+  const href = (tt) => `#/m/${encodeURIComponent(r.id)}?t=${tt}&q=${encodeURIComponent(raw)}`;
+  return h('div', { class: 'card sres' },
+    h('a', { class: 'sres-head', href: '#/m/' + encodeURIComponent(r.id) },
+      h('b', null, highlight(r.title || 'Без назви', words)), h('span', { class: 'hint' }, `${fmtDateShort(r.start)}, ${fmtTime(r.start)}`)),
+    r.sumHit ? h('p', { class: 'hint sres-sum' }, highlight(snippet(r.summary, words), words)) : null,
+    r.hits.slice(0, 5).map(x => h('a', { class: 'sres-hit', href: href(x.t) },
+      h('span', { class: 'ts' }, fmtDuration(x.t)),
+      h('span', null, x.speaker ? h('b', null, x.speaker + ': ') : null, highlight(snippet(x.text, words), words)))),
+    r.hits.length > 5 ? h('a', { class: 'linkish small', href: href(r.hits[5].t) }, `ще ${r.hits.length - 5} збігів у цій нараді`) : null);
+}
+
+function backendAtLeast(v) {
+  const c = api.cfg();
+  return !!(c && c.info && verGte(c.info.version, v));
 }
 
 /* =================== Картка наради =================== */
@@ -270,17 +316,19 @@ async function viewMeetingEv(key) {
   renderMeeting(m);
 }
 
-async function viewMeeting(id) {
+async function viewMeeting(id, params) {
   const t = seq;
+  const focus = params && params.get('t') !== null ? { t: Number(params.get('t')) || 0, q: params.get('q') || '' } : null;
   const cached = S.meetings.get(id);
-  if (cached) renderMeeting(cached);
+  if (cached) renderMeeting(cached, focus);
   else view.appendChild(spinner());
   const [m] = await Promise.all([api.call('getMeeting', { id }), api.getPeople().catch(() => [])]);
   if (!alive(t)) return;
   S.meetings.set(m.id, m);
-  if (cached && JSON.stringify(cached) === JSON.stringify(m) && view.querySelector('.meeting')) { refreshMeetingData(m); return; }
+  // Нарада не змінилась — картка вже показана й тексти вантажаться, перемальовувати не треба.
+  if (cached && JSON.stringify(cached) === JSON.stringify(m) && view.querySelector('.meeting')) return;
   clear(view);
-  renderMeeting(m);
+  renderMeeting(m, focus);
 }
 
 async function ensureRow(m) {
@@ -293,9 +341,9 @@ async function ensureRow(m) {
 
 let MV = null; // стан відкритої картки
 
-function renderMeeting(m) {
+function renderMeeting(m, focus) {
   const t = seq;
-  MV = { m, transcripts: null, analysis: null, tab: MV && MV.m && MV.m.id === m.id ? MV.tab : null, engine: null, t };
+  MV = { m, transcripts: null, analysis: null, tab: focus ? 'text' : (MV && MV.m && MV.m.id === m.id ? MV.tab : null), engine: null, t, focus: focus || null };
   const st = new Date(m.start), en = new Date(m.end);
   const people = api.peopleSync();
   const parts = (m.participants || []).map(id => people.find(p => p.id === id)).filter(Boolean);
@@ -317,6 +365,7 @@ function renderMeeting(m) {
       : h('button', { class: 'linkish', onclick: async () => { const r = await ensureRow(m); go('#/edit/' + encodeURIComponent(r.id)); } }, '+ додати учасників'),
     m.notes ? h('p', { class: 'notes' }, m.notes) : null));
 
+  if (m.status !== 'analyzed' && backendAtLeast('1.1.0')) root.appendChild(agendaBox(m));
   const jobBox = m.id ? jobPanel(m.id, (j) => { if (alive(t) && j.meeting) { S.meetings.set(j.meeting.id, j.meeting); clear(view); renderMeeting(j.meeting); } }) : h('div');
   root.appendChild(jobBox);
   root.appendChild(audioPanel(m));
@@ -324,11 +373,6 @@ function renderMeeting(m) {
   root.appendChild(tabsHost);
   view.appendChild(root);
   if (m.id && (m.engines.length || m.status === 'analyzed')) loadTabs(m, tabsHost);
-}
-
-function refreshMeetingData(m) {
-  const host = view.querySelector('.tabs-host');
-  if (host && m.id && (m.engines.length || m.status === 'analyzed')) loadTabs(m, host);
 }
 
 async function loadTabs(m, host) {
@@ -383,19 +427,112 @@ function tabSummary(m, el) {
       h('button', { class: 'btn ghost', onclick: () => analyzeFlow(m) }, 'Перезробити підсумок')));
 }
 
-function tasksText(a) {
-  return a.tasks.map((t, i) => `${i + 1}. ${t.task} — ${t.owner || '—'}${t.due ? ' (до: ' + t.due + ')' : ''}`).join('\n');
+async function tabTasks(m, el) {
+  const a = MV.analysis;
+  if (!backendAtLeast('1.1.0')) {
+    // Старий скрипт: показуємо задачі з підсумку без статусів.
+    if (!a) { put(el, h('div', { class: 'empty' }, 'Задачі зʼявляться після підсумку.')); return; }
+    if (!a.tasks.length) { put(el, h('div', { class: 'empty' }, 'На нараді задач не зафіксовано.')); return; }
+    put(el, h('div', { class: 'stack' }, a.tasks.map(x => h('div', { class: 'card task' }, h('div', { class: 'grow' }, h('div', { class: 'task-text' }, x.task),
+      h('div', { class: 'task-meta' }, h('span', { class: 'chip small' }, x.owner || '—'), h('span', { class: 'due muted' }, x.due || 'без терміну')))))),
+      h('div', { class: 'row' }, h('button', { class: 'btn', onclick: () => copyText(tasksListText(a.tasks)) }, icon('copy'), 'Скопіювати задачі')));
+    return;
+  }
+  const t = seq;
+  put(el, spinner());
+  let mine, carried;
+  try { [mine, carried] = await Promise.all([api.call('listTasks', { meetingId: m.id }), api.call('carriedTasks', { meetingId: m.id })]); }
+  catch (e) { if (alive(t)) put(clear(el), h('div', { class: 'error-box' }, e.message)); return; }
+  if (!alive(t) || !el.isConnected) return;
+  clear(el);
+  const sug = new Set((a && a.reportedDone) || []);
+  const redraw = () => { clear(el); tabTasks(m, el); };
+  const onChange = (x, kind) => { if (kind !== 'status') redraw(); };
+  if (!mine.length && !carried.length) {
+    put(el, h('div', { class: 'empty' }, a ? 'На нараді задач не зафіксовано.' : 'Задачі зʼявляться після підсумку.'));
+  }
+  if (mine.length) {
+    put(el, h('h3', { class: 'sub-h' }, 'З цієї наради'), h('div', { class: 'stack' }, sortTasks(mine).map(x => taskCard(x, { onChange, showMeeting: false }))));
+  }
+  if (carried.length) {
+    put(el, h('h3', { class: 'sub-h' }, `З минулих нарад — ще відкриті (${carried.length})`),
+      h('p', { class: 'hint' }, sug.size ? 'Позначені «схоже, виконано» — за розмовою на цій нараді. Перевір і постав галочку.' : 'Постав галочку на тих, що вже виконано.'),
+      h('div', { class: 'stack' }, sortTasks(carried).map(x => taskCard(x, { onChange, suggestedDone: sug.has(x.id) }))));
+  }
+  const all = [...mine, ...carried.filter(x => x.status !== 'done')];
+  if (all.length) put(el, h('div', { class: 'row wrap' },
+    h('button', { class: 'btn', onclick: () => copyText(tasksListText(sortTasks(all))) }, icon('copy'), 'Скопіювати задачі'),
+    h('a', { class: 'btn ghost', href: '#/tasks' }, 'Усі задачі')));
 }
 
-function tabTasks(m, el) {
-  const a = MV.analysis;
-  if (!a) { put(el, h('div', { class: 'empty' }, 'Задачі зʼявляться після підсумку.')); return; }
-  if (!a.tasks.length) { put(el, h('div', { class: 'empty' }, 'На нараді задач не зафіксовано.')); return; }
-  put(el, 
-    h('div', { class: 'stack' }, a.tasks.map(t => h('div', { class: 'card task' },
-      h('div', { class: 'task-text' }, t.task),
-      h('div', { class: 'task-meta' }, h('span', { class: 'chip small' }, t.owner || '—'), t.due ? h('span', { class: 'due' }, 'до: ' + t.due) : h('span', { class: 'due muted' }, 'без терміну'))))),
-    h('div', { class: 'row' }, h('button', { class: 'btn', onclick: () => copyText(tasksText(a)) }, icon('copy'), 'Скопіювати задачі')));
+// Порядок денний: відкриті задачі з минулих нарад серії (або з тією ж назвою).
+function agendaBox(m) {
+  const box = h('div', { class: 'card agenda', hidden: true });
+  const args = m.id ? { meetingId: m.id } : { eventId: m.eventId, recurring: !!m.recurring, title: m.title, start: m.start };
+  api.call('carriedTasks', args).then((list) => {
+    if (!list.length || !box.isConnected) return;
+    const draw = () => {
+      const open = list.filter(x => x.status !== 'done');
+      clear(box);
+      box.hidden = !list.length;
+      put(box, h('div', { class: 'row between' }, h('b', null, `До порядку денного: відкриті задачі (${open.length})`),
+        h('button', { class: 'btn small ghost', onclick: () => copyText('Відкриті задачі з минулих нарад:\n' + tasksListText(sortTasks(open))) }, icon('copy'), 'Скопіювати')),
+        h('p', { class: 'hint' }, 'З минулих нарад цієї серії. Відміть виконані — решта перейде на наступну нараду.'),
+        h('div', { class: 'stack' }, sortTasks(list).map(x => taskCard(x, { onChange: (y, kind) => { if (kind === 'deleted') list.splice(list.indexOf(x), 1); draw(); } }))));
+    };
+    draw();
+  }).catch(() => { });
+  return box;
+}
+
+/* =================== Задачі (усі) =================== */
+
+async function viewTasks() {
+  const t = seq;
+  put(view, topbar('Задачі', { actions: [h('button', { class: 'btn primary small', onclick: () => editTask(null, () => render()) }, icon('plus'), 'Задача')] }));
+  if (!backendAtLeast('1.1.0')) {
+    await api.loadConfig().catch(() => null);
+    if (!alive(t)) return;
+    if (!backendAtLeast('1.1.0')) { put(view, h('div', { class: 'empty' }, 'Щоб бачити всі задачі з нарад, онови скрипт Google до версії 1.1.0.')); return; }
+  }
+  const f = S.taskFilter || (S.taskFilter = { status: 'open', owner: '', q: '' });
+  const chips = h('div', { class: 'chips' });
+  const owner = h('select', { class: 'input' });
+  const q = h('input', { type: 'search', class: 'input', placeholder: 'Пошук у задачах…', value: f.q });
+  const list = h('div', { class: 'stack' }, spinner());
+  let all = [];
+  const reportBtn = h('button', { class: 'btn small', onclick: () => copyText(weeklyReport(all)) }, icon('copy'), 'Звіт за тиждень');
+  put(view, chips, h('div', { class: 'grid2' }, owner, q), h('div', { class: 'row wrap' }, reportBtn,
+    h('span', { class: 'hint' }, 'виконане за тиждень, прострочене й у роботі — текстом для звіту')), list);
+
+  try { [all] = await Promise.all([api.call('listTasks', {}), api.getPeople().catch(() => [])]); }
+  catch (e) { if (alive(t)) put(clear(list), h('div', { class: 'error-box' }, e.message)); return; }
+  if (!alive(t)) return;
+
+  const draw = () => {
+    const open = all.filter(x => x.status !== 'done'), late = all.filter(isOverdue), done = all.filter(x => x.status === 'done');
+    clear(chips);
+    [['open', `Відкриті (${open.length})`], ['late', `Прострочені (${late.length})`], ['done', `Виконані (${done.length})`], ['all', 'Усі']].forEach(([id, label]) =>
+      put(chips, h('button', { class: 'chip toggle' + (f.status === id ? ' on' : '') + (id === 'late' && late.length ? ' warn' : ''), onclick: () => { f.status = id; draw(); } }, label)));
+    const owners = [...new Set(all.map(x => (x.owner || '—').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
+    clear(owner);
+    put(owner, h('option', { value: '' }, 'Усі відповідальні'), owners.map(o => h('option', { value: o }, o)));
+    owner.value = owners.includes(f.owner) ? f.owner : '';
+    const qq = f.q.trim().toLowerCase();
+    let shown = f.status === 'open' ? open : f.status === 'late' ? late : f.status === 'done' ? done : all;
+    if (owner.value) shown = shown.filter(x => (x.owner || '—').trim() === owner.value);
+    if (qq) shown = shown.filter(x => (x.task + ' ' + x.owner + ' ' + (x.meetingTitle || '')).toLowerCase().includes(qq));
+    clear(list);
+    if (!shown.length) { put(list, h('div', { class: 'empty' }, all.length ? 'Нічого не знайдено' : 'Задач ще немає. Вони зʼявляються після підсумку наради або додаються кнопкою «Задача».')); return; }
+    sortTasks(shown).forEach(x => put(list, taskCard(x, { onChange: (y, kind) => {
+      if (kind === 'deleted') all = all.filter(z => z.id !== x.id);
+      else if (kind === 'created') all.push(y);
+      draw();
+    } })));
+  };
+  owner.addEventListener('change', () => { f.owner = owner.value; draw(); });
+  q.addEventListener('input', () => { f.q = q.value; draw(); });
+  draw();
 }
 
 function engineChips(selected, onPick) {
@@ -431,20 +568,30 @@ function tabText(m, el) {
 
   const q = h('input', { type: 'search', class: 'input', placeholder: 'Пошук у тексті…' });
   const list = h('div', { class: 'segs' });
+  const focus = MV.focus;
+  const words = focus && focus.q ? queryWords(focus.q) : [];
   const draw = () => {
     clear(list);
     const s = q.value.trim().toLowerCase();
     const segs = tr.segments.filter(x => !s || x.text.toLowerCase().includes(s) || nameOf(x.speaker).toLowerCase().includes(s));
     if (!segs.length) { put(list, h('div', { class: 'empty' }, 'Нічого не знайдено')); return; }
-    segs.forEach(x => put(list, h('div', { class: 'seg' },
+    segs.forEach(x => put(list, h('div', { class: 'seg', dataset: { t: Math.round(x.start) } },
       h('button', { class: 'ts', onclick: () => seek(x.start) }, fmtDuration(x.start)),
       h('div', null,
         x.speaker ? h('b', { class: 'spk', style: { color: colorFor(nameOf(x.speaker)) } }, nameOf(x.speaker)) : null,
-        h('span', null, x.text)))));
+        h('span', null, words.length ? highlight(x.text, words) : x.text)))));
   };
   q.addEventListener('input', draw);
   put(el, q, list);
   draw();
+  if (focus) {
+    MV.focus = null;
+    const nodes = $$('.seg', list);
+    let best = null;
+    for (const n of nodes) { if (Number(n.dataset.t) <= focus.t + 1) best = n; else break; }
+    best = best || nodes[0];
+    if (best) { best.classList.add('flash'); setTimeout(() => best.scrollIntoView({ block: 'center', behavior: 'smooth' }), 80); }
+  }
 }
 
 function speakerPanel(m, engine, tr, redraw) {
@@ -837,7 +984,10 @@ async function viewEdit(id, params) {
   const save = async (e) => {
     e.preventDefault();
     if (!title.value.trim()) { title.focus(); return; }
-    const s = new Date(`${date.value}T${t1.value}`), en = new Date(`${date.value}T${t2.value}`);
+    const s = new Date(`${date.value}T${t1.value}`);
+    let en = new Date(`${date.value}T${t2.value}`);
+    // Нарада через північ (напр. 23:00–00:30): кінець — наступного дня.
+    if (en <= s) { const next = addDays(en, 1); if (next - s <= 12 * 3600e3) en = next; }
     if (en <= s) { toast('Кінець має бути пізніше за початок', 'err'); return; }
     btn.disabled = true;
     try {
@@ -1275,7 +1425,7 @@ function viewConnect() {
 function buildShell() {
   const nav = h('nav', { class: 'nav' },
     h('div', { class: 'brand' }, h('span', { class: 'logo' }, icon('wave')), 'Наради'),
-    [['calendar', '#/calendar', 'Календар', 'calendar'], ['recordings', '#/recordings', 'Записи', 'list'], ['people', '#/people', 'Люди', 'people'], ['settings', '#/settings', 'Налаштування', 'settings']]
+    [['calendar', '#/calendar', 'Календар', 'calendar'], ['recordings', '#/recordings', 'Записи', 'list'], ['tasks', '#/tasks', 'Задачі', 'check'], ['people', '#/people', 'Люди', 'people'], ['settings', '#/settings', 'Налаштування', 'settings']]
       .map(([sec, href, label, ic]) => h('a', { href, dataset: { sec } }, icon(ic), h('span', null, label))));
   document.body.insertBefore(nav, document.body.firstChild);
 }
@@ -1290,4 +1440,8 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 
 buildShell();
-render();
+(async () => {
+  // Спершу підтягуємо налаштування й версію скрипта, щоб показати лише те, що він уміє.
+  if (api.getConn()) { put(view, spinner()); try { await api.loadConfig(); } catch { } }
+  render();
+})();

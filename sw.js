@@ -1,10 +1,10 @@
 // Service worker: офлайн-кеш оболонки додатку і прийом файлів через «Поділитися» на Android.
 
-const VERSION = 'narady-1.0.3';
+const VERSION = 'narady-1.1.0';
 const ASSETS = [
   './', './index.html', './app.css', './manifest.webmanifest',
   './js/app.js', './js/ui.js', './js/api.js', './js/store.js', './js/audio.js', './js/mp3worker.js',
-  './js/recorder.js', './js/engines.js', './js/pipeline.js', './js/drive.js',
+  './js/recorder.js', './js/engines.js', './js/pipeline.js', './js/drive.js', './js/tasks.js', './js/search.js',
   './vendor/lame.min.js', './icons/icon-192.png', './icons/icon-512.png'
 ];
 
@@ -18,13 +18,15 @@ self.addEventListener('activate', (e) => {
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('narady', 1);
+    const req = indexedDB.open('narady', 2);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('recChunks')) d.createObjectStore('recChunks', { autoIncrement: true }).createIndex('recId', 'recId');
       if (!d.objectStoreNames.contains('recMeta')) d.createObjectStore('recMeta', { keyPath: 'recId' });
       if (!d.objectStoreNames.contains('prepared')) d.createObjectStore('prepared');
       if (!d.objectStoreNames.contains('shared')) d.createObjectStore('shared', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('search')) d.createObjectStore('search', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);

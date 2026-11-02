@@ -7,13 +7,14 @@
  * Потім: Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
  */
 
-const APP_VERSION = '1.0.2';
-const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник', series: 'Серії' };
+const APP_VERSION = '1.1.0';
+const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник', series: 'Серії', tasks: 'Задачі' };
 const M_COLS = ['id', 'eventId', 'title', 'start', 'end', 'participants', 'notes', 'folderId',
   'audioFileId', 'audioName', 'durationSec', 'engines', 'primaryEngine', 'speakerMap',
   'docId', 'status', 'updatedAt'];
 const P_COLS = ['id', 'name', 'role', 'aliases'];
 const S_COLS = ['eventId', 'title', 'participants', 'notes', 'freq', 'until'];
+const T_COLS = ['id', 'meetingId', 'seriesKey', 'meetingTitle', 'meetingStart', 'owner', 'task', 'due', 'dueDate', 'status', 'doneAt', 'source', 'edited', 'createdAt', 'updatedAt'];
 const DESC_MARK = '\n\n— Наради —\n';
 
 /* ---------- Перше налаштування ---------- */
@@ -41,8 +42,9 @@ function setup() {
   ensureSheet_(ss, SHEETS.people, P_COLS);
   ensureSheet_(ss, SHEETS.glossary, ['term']);
   ensureSheet_(ss, SHEETS.series, S_COLS);
+  ensureSheet_(ss, SHEETS.tasks, T_COLS);
   ss.getSheets().forEach(function (sh) {
-    const known = [SHEETS.meetings, SHEETS.people, SHEETS.glossary, SHEETS.series].indexOf(sh.getName()) >= 0;
+    const known = [SHEETS.meetings, SHEETS.people, SHEETS.glossary, SHEETS.series, SHEETS.tasks].indexOf(sh.getName()) >= 0;
     if (!known && sh.getLastRow() === 0 && ss.getSheets().length > 3) ss.deleteSheet(sh);
   });
 
@@ -121,6 +123,11 @@ const ACTIONS = {
   saveMeetingState: saveMeetingState_,
   saveAnalysis: saveAnalysis_,
   getAnalysis: getAnalysis_,
+  listTasks: listTasks_,
+  carriedTasks: carriedTasks_,
+  saveTask: saveTask_,
+  deleteTask: deleteTask_,
+  searchCorpus: searchCorpus_,
   buildDoc: buildDoc_,
   proxy: proxy_
 };
@@ -633,6 +640,7 @@ function saveAnalysis_(a) {
     row.status = 'analyzed';
     row.updatedAt = new Date().toISOString();
     writeRow_(sh, M_COLS, row);
+    syncTasks_(row, a.analysis);
     return toMeeting_(row, null);
   });
 }
@@ -641,6 +649,154 @@ function getAnalysis_(a) {
   const row = rowOrThrow_(sheet_(SHEETS.meetings), a.meetingId);
   if (!row.folderId) return null;
   return readJson_(DriveApp.getFolderById(row.folderId), 'analysis.json');
+}
+
+/* ---------- Задачі з нарад ---------- */
+
+function tasksSheet_() {
+  const ss = SpreadsheetApp.openById(prop_('SHEET_ID'));
+  return ss.getSheetByName(SHEETS.tasks) || ensureSheet_(ss, SHEETS.tasks, T_COLS);
+}
+
+function normTitle_(t) { return String(t || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+function normText_(t) { return String(t || '').toLowerCase().replace(/[^0-9a-zа-яіїєґ']+/gi, ' ').trim(); }
+
+// Ключ «серії»: повторювана подія календаря або нарада з тією самою назвою.
+function seriesKeyFor_(row) {
+  const ev = eventForRow_(row);
+  return ev && ev.isRecurringEvent() ? 'ev:' + row.eventId : 't:' + normTitle_(row.title);
+}
+
+function cleanTask_(t) {
+  return { id: t.id, meetingId: t.meetingId, seriesKey: t.seriesKey, meetingTitle: t.meetingTitle, meetingStart: t.meetingStart,
+    owner: t.owner, task: t.task, due: t.due, dueDate: t.dueDate, status: t.status || 'open', doneAt: t.doneAt, source: t.source, edited: t.edited === '1' };
+}
+
+// Після кожного підсумку оновлюємо задачі наради. Виконані й відредаговані вручну не чіпаємо.
+function syncTasks_(row, analysis) {
+  const sh = tasksSheet_();
+  const mine = readTable_(sh, T_COLS).filter(function (t) { return t.meetingId === row.id; });
+  const drop = mine.filter(function (t) { return t.source === 'auto' && t.status !== 'done' && t.edited !== '1'; });
+  const keep = mine.filter(function (t) { return drop.indexOf(t) < 0; });
+  drop.sort(function (x, y) { return y._row - x._row; }).forEach(function (t) { sh.deleteRow(t._row); });
+  const seen = {};
+  keep.forEach(function (t) { seen[normText_(t.task)] = true; });
+  const key = seriesKeyFor_(row);
+  const now = new Date().toISOString();
+  ((analysis && analysis.tasks) || []).forEach(function (t) {
+    const txt = String(t.task || '').trim();
+    if (!txt || seen[normText_(txt)]) return;
+    seen[normText_(txt)] = true;
+    writeRow_(sh, T_COLS, { id: newId_('t_'), meetingId: row.id, seriesKey: key, meetingTitle: row.title, meetingStart: row.start,
+      owner: String(t.owner || ''), task: txt, due: String(t.due || ''), dueDate: /^\d{4}-\d{2}-\d{2}$/.test(t.dueDate || '') ? t.dueDate : '',
+      status: 'open', doneAt: '', source: 'auto', edited: '', createdAt: now, updatedAt: now });
+  });
+}
+
+// Один раз переносимо задачі з підсумків, зроблених до появи списку задач.
+function ensureTasksMigrated_() {
+  if (prop_('TASKS_V')) return;
+  withLock_(function () {
+    if (prop_('TASKS_V')) return;
+    const existing = {};
+    readTable_(tasksSheet_(), T_COLS).forEach(function (t) { existing[t.meetingId] = true; });
+    readTable_(sheet_(SHEETS.meetings), M_COLS).forEach(function (row) {
+      if (existing[row.id] || !row.folderId) return;
+      try {
+        const an = readJson_(DriveApp.getFolderById(row.folderId), 'analysis.json');
+        if (an && an.tasks && an.tasks.length) syncTasks_(row, an);
+      } catch (e) { }
+    });
+    setProp_('TASKS_V', '1');
+  });
+}
+
+function listTasks_(a) {
+  ensureTasksMigrated_();
+  return readTable_(tasksSheet_(), T_COLS)
+    .filter(function (t) { return !a.meetingId || t.meetingId === a.meetingId; })
+    .map(cleanTask_);
+}
+
+// Відкриті задачі з попередніх нарад тієї ж серії (або з тією самою назвою).
+function carriedTasks_(a) {
+  ensureTasksMigrated_();
+  let evKey = '', title = '', start = '', selfId = a.meetingId || '';
+  if (a.meetingId) {
+    const row = rowOrThrow_(sheet_(SHEETS.meetings), a.meetingId);
+    const k = seriesKeyFor_(row);
+    evKey = k.indexOf('ev:') === 0 ? k : '';
+    title = row.title; start = row.start;
+  } else {
+    evKey = a.recurring && a.eventId ? 'ev:' + a.eventId : '';
+    title = a.title; start = a.start;
+  }
+  const nt = normTitle_(title), st = new Date(start).getTime();
+  return readTable_(tasksSheet_(), T_COLS).filter(function (t) {
+    if (t.status === 'done' || t.meetingId === selfId) return false;
+    if (!(new Date(t.meetingStart).getTime() < st)) return false;
+    return (evKey && t.seriesKey === evKey) || (nt && normTitle_(t.meetingTitle) === nt);
+  }).map(cleanTask_);
+}
+
+function saveTask_(a) {
+  return withLock_(function () {
+    const sh = tasksSheet_();
+    const t = a.task || {};
+    const now = new Date().toISOString();
+    let row = t.id ? readTable_(sh, T_COLS).filter(function (x) { return x.id === t.id; })[0] : null;
+    if (!row) {
+      if (!t.task || !String(t.task).trim()) throw new Error('Опиши задачу');
+      row = { id: newId_('t_'), meetingId: '', seriesKey: '', meetingTitle: '', meetingStart: '', status: 'open', source: 'manual', createdAt: now };
+    }
+    const content = ['task', 'owner', 'dueDate', 'due'].some(function (k) { return t[k] !== undefined && String(t[k]) !== String(row[k] || ''); });
+    ['task', 'owner', 'due'].forEach(function (k) { if (t[k] !== undefined) row[k] = String(t[k]).trim(); });
+    if (t.dueDate !== undefined) row.dueDate = /^\d{4}-\d{2}-\d{2}$/.test(t.dueDate) ? t.dueDate : '';
+    if (t.status !== undefined && t.status !== row.status) { row.status = t.status === 'done' ? 'done' : 'open'; row.doneAt = row.status === 'done' ? now : ''; }
+    if (content && row.source === 'auto') row.edited = '1';
+    row.updatedAt = now;
+    writeRow_(sh, T_COLS, row);
+    return cleanTask_(row);
+  });
+}
+
+function deleteTask_(a) {
+  return withLock_(function () {
+    const sh = tasksSheet_();
+    const row = readTable_(sh, T_COLS).filter(function (x) { return x.id === a.id; })[0];
+    if (row) sh.deleteRow(row._row);
+    return true;
+  });
+}
+
+/* ---------- Пошук: тексти нарад для індексу на пристрої ---------- */
+
+function searchCorpus_(a) {
+  const rows = readTable_(sheet_(SHEETS.meetings), M_COLS).filter(function (r) { return r.folderId && parseJson_(r.engines, []).length; });
+  const since = a.since || '';
+  const changed = rows.filter(function (r) { return !since || (r.updatedAt || '') > since; })
+    .sort(function (x, y) { return (x.updatedAt || '') < (y.updatedAt || '') ? -1 : 1; });
+  const items = [];
+  let size = 0, cursor = since;
+  for (let i = 0; i < changed.length; i++) {
+    const r = changed[i];
+    const eng = r.primaryEngine || parseJson_(r.engines, [])[0];
+    let segs = [], summary = '';
+    try {
+      const folder = DriveApp.getFolderById(r.folderId);
+      const tr = readJson_(folder, 'transcript_' + eng + '.json');
+      const an = readJson_(folder, 'analysis.json');
+      if (tr && tr.segments) segs = tr.segments.map(function (s) { return [Math.round(s.start || 0), s.speaker || '', s.text || '']; });
+      else if (tr && tr.text) segs = [[0, '', tr.text]];
+      if (an) summary = an.summary || '';
+    } catch (e) { }
+    const item = { id: r.id, title: r.title, start: r.start, engine: eng, speakerMap: (parseJson_(r.speakerMap, {}) || {})[eng] || {}, updatedAt: r.updatedAt, summary: summary, segs: segs };
+    items.push(item);
+    cursor = r.updatedAt || cursor;
+    size += JSON.stringify(item).length;
+    if (size > 3000000) break;
+  }
+  return { items: items, ids: rows.map(function (r) { return r.id; }), cursor: cursor, more: items.length < changed.length };
 }
 
 /* ---------- Google Doc з підсумком ---------- */
@@ -709,7 +865,8 @@ function buildDoc_(a) {
       if (analysis.tasks && analysis.tasks.length) {
         body.appendParagraph('Задачі').setHeading(H.HEADING1);
         const rows = [['Хто', 'Що', 'Термін']].concat(analysis.tasks.map(function (t) {
-          return [String(t.owner || '—'), String(t.task || ''), String(t.due || '—')];
+          const due = t.dueDate ? t.dueDate.split('-').reverse().join('.') : (t.due || '—');
+          return [String(t.owner || '—'), String(t.task || ''), String(due)];
         }));
         const table = body.appendTable(rows);
         const hr = table.getRow(0);

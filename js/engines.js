@@ -411,12 +411,13 @@ const ANALYSIS_SCHEMA = {
       type: 'ARRAY',
       items: {
         type: 'OBJECT',
-        properties: { owner: { type: 'STRING' }, task: { type: 'STRING' }, due: { type: 'STRING' } },
-        required: ['owner', 'task', 'due']
+        properties: { owner: { type: 'STRING' }, task: { type: 'STRING' }, due: { type: 'STRING' }, dueDate: { type: 'STRING', description: 'РРРР-ММ-ДД або порожньо' } },
+        required: ['owner', 'task', 'due', 'dueDate']
       }
     },
     openQuestions: { type: 'ARRAY', items: { type: 'STRING' } },
-    facts: { type: 'ARRAY', items: { type: 'STRING' } }
+    facts: { type: 'ARRAY', items: { type: 'STRING' } },
+    reportedDone: { type: 'ARRAY', items: { type: 'STRING' } }
   },
   required: ['summary', 'decisions', 'tasks', 'openQuestions', 'facts']
 };
@@ -438,23 +439,27 @@ export function transcriptAsText(tr, nameOf = (x) => x) {
 function analysisPrompt(meta, transcriptText, ctx) {
   const people = (ctx.participants || []).map(p => `${p.name}${p.role ? ' (' + p.role + ')' : ''}`).join(', ') || 'не вказано';
   const terms = (ctx.glossary || []).join(', ');
+  const carry = (ctx.carryTasks || []).map((t, i) => `[k${i + 1}] ${t.task} — ${t.owner || '—'}${t.meetingStart ? ' (з наради ' + t.meetingStart.slice(0, 10) + ')' : ''}`).join('\n');
   return `Ти — помічник керівника виробництва. Нижче автоматична розшифровка робочої наради (можуть бути помилки розпізнавання).
 Склади короткий структурований підсумок українською мовою.
 
-Нарада: «${meta.title}», ${meta.dateText}.
+Нарада: «${meta.title}», ${meta.dateText}. Дата наради: ${meta.dateISO} (${meta.weekday}).
 Учасники: ${people}.
-${terms ? 'Терміни й назви, які можуть зустрічатися: ' + terms + '.\n' : ''}
+${terms ? 'Терміни й назви, які можуть зустрічатися: ' + terms + '.\n' : ''}${carry ? 'Відкриті задачі з попередніх нарад:\n' + carry + '\n' : ''}
 Поверни ТІЛЬКИ JSON такого вигляду:
 {"summary": "3–6 речень: про що нарада і до чого дійшли",
  "decisions": ["прийняте рішення"],
- "tasks": [{"owner": "хто", "task": "що зробити", "due": "термін або порожній рядок"}],
+ "tasks": [{"owner": "хто", "task": "що зробити", "due": "термін словами або порожній рядок", "dueDate": "РРРР-ММ-ДД або порожній рядок"}],
  "openQuestions": ["питання, що лишилося відкритим"],
- "facts": ["важливі цифри, дати, обсяги, показники"]}
+ "facts": ["важливі цифри, дати, обсяги, показники"],
+ "reportedDone": []}
 
 Правила:
 - Тільки те, що є в розмові. Нічого не вигадуй.
 - Задача — це конкретна дія, яку хтось взяв на себе або доручили. Власника пиши іменем учасника; якщо незрозуміло — «—».
-- Якщо термін не названо — due порожній.
+- Якщо термін не названо — due і dueDate порожні. Якщо термін можна перевести в конкретну дату відносно дати наради («до п'ятниці», «завтра», «до 15-го»), запиши її в dueDate у форматі РРРР-ММ-ДД.
+- reportedDone — мітки (k1, k2…) відкритих задач з попередніх нарад, про які на цій нараді прямо сказали, що їх виконано. Якщо таких немає або список задач не дано — [].
+- Не повторюй у tasks задачі з попередніх нарад, якщо по них не дали нового доручення чи нового терміну.
 - Очевидні помилки розпізнавання в іменах і термінах виправляй.
 - Пиши коротко й по суті. Порожні списки — [].
 
@@ -500,9 +505,13 @@ export async function analyze(tr, meta, ctx) {
   return {
     summary: String(j.summary || ''),
     decisions: arr(j.decisions),
-    tasks: Array.isArray(j.tasks) ? j.tasks.map(t => ({ owner: String(t.owner || '—'), task: String(t.task || ''), due: String(t.due || '') })).filter(t => t.task) : [],
+    tasks: Array.isArray(j.tasks) ? j.tasks.map(t => ({
+      owner: String(t.owner || '—'), task: String(t.task || ''), due: String(t.due || ''),
+      dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(t.dueDate || '')) ? String(t.dueDate) : ''
+    })).filter(t => t.task) : [],
     openQuestions: arr(j.openQuestions),
     facts: arr(j.facts),
+    reportedDone: arr(j.reportedDone).map(k => { const m = /k?(\d+)/i.exec(k); const t = m && (ctx.carryTasks || [])[Number(m[1]) - 1]; return t ? t.id : null; }).filter(Boolean),
     engine, engineName: an.name, model,
     basedOn: tr.engine,
     createdAt: new Date().toISOString()

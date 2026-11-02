@@ -45,6 +45,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
@@ -344,3 +345,30 @@ details.card .field { margin-bottom: 10px; }
 .dim { position: fixed; inset: 0; z-index: 100; background: #000; color: #3d3d3d; display: flex; flex-direction: column; align-items: center; padding-top: 35vh; cursor: pointer; transition: padding-top 2s; }
 .dim-clock { font-size: 44px; font-weight: 300; font-variant-numeric: tabular-nums; }
 .dim-hint { font-size: 13px; margin-top: 10px; color: #2e2e2e; }
+
+/* ---------- Задачі ---------- */
+.task { display: flex; gap: 12px; align-items: flex-start; }
+.task-check { padding-top: 2px; }
+.task-check input { width: 22px; height: 22px; accent-color: var(--accent); cursor: pointer; }
+.task-body { cursor: pointer; min-width: 0; }
+.task.done .task-text { text-decoration: line-through; color: var(--muted); }
+.task.overdue { border-color: var(--err); }
+.due.late { color: var(--err); }
+.mlink { font-size: 13px; color: var(--muted); text-decoration: none; }
+.mlink:hover { color: var(--accent); }
+.chip.toggle.warn:not(.on) { color: var(--err); }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 8px; margin: 4px 0 8px; }
+@media (max-width: 560px) { .grid2 { grid-template-columns: 1fr; } }
+.sub-h { margin: 8px 0 2px; font-size: 14px; color: var(--muted); }
+.agenda { margin: 12px 0; display: flex; flex-direction: column; gap: 8px; background: var(--accent-soft); border-color: transparent; }
+.agenda .task { background: var(--surface); }
+
+/* ---------- Пошук ---------- */
+mark { background: #ffe27a; color: inherit; border-radius: 3px; padding: 0 1px; }
+@media (prefers-color-scheme: dark) { mark { background: #6b5a12; } }
+.sres { display: flex; flex-direction: column; gap: 4px; }
+.sres-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; text-decoration: none; color: inherit; flex-wrap: wrap; }
+.sres-sum { margin: 0; }
+.sres-hit { display: grid; grid-template-columns: 56px 1fr; gap: 8px; text-decoration: none; color: inherit; padding: 6px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.sres-hit:hover { color: var(--accent); }
+.seg.flash { background: var(--accent-soft); border-radius: 8px; padding-left: 6px; padding-right: 6px; }

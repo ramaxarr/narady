@@ -1,7 +1,7 @@
 // Локальне сховище в браузері (IndexedDB): шматки запису, підготовлене аудіо, файли «Поділитися».
 
 const DB_NAME = 'narady';
-const DB_VER = 1;
+const DB_VER = 2;
 let dbp = null;
 
 function db() {
@@ -17,6 +17,8 @@ function db() {
       if (!d.objectStoreNames.contains('recMeta')) d.createObjectStore('recMeta', { keyPath: 'recId' });
       if (!d.objectStoreNames.contains('prepared')) d.createObjectStore('prepared');
       if (!d.objectStoreNames.contains('shared')) d.createObjectStore('shared', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('search')) d.createObjectStore('search', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
