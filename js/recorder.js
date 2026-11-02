@@ -10,14 +10,18 @@ function pickMime() {
 }
 
 export class Recorder {
-  constructor({ meetingId, onLevel, onState, onInterrupted }) {
+  constructor({ meetingId, onLevel, onState, onInterrupted, onWarn }) {
     this.meetingId = meetingId;
     this.onLevel = onLevel || (() => { });
     this.onState = onState || (() => { });
     this.onInterrupted = onInterrupted || null;
+    this.onWarn = onWarn || null;
     this.recId = 'r_' + Date.now();
     this.seq = 0;
     this.chunks = [];
+    this.pending = [];     // шматки, які ще не вдалося зберегти в пам'ять пристрою
+    this.saving = false;
+    this.warned = false;
     this.elapsedBefore = 0;
     this.startedAt = 0;
     this.state = 'idle';
@@ -35,30 +39,50 @@ export class Recorder {
       audio: { echoCancellation: false, noiseSuppression, autoGainControl: true, channelCount: 1 }
     });
     this.mime = pickMime();
-    this.mr = new MediaRecorder(this.stream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
+    try { this.mr = new MediaRecorder(this.stream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined); }
+    catch { this.mr = new MediaRecorder(this.stream); }
     this.mime = this.mr.mimeType || this.mime || 'audio/webm';
-    await idb.put('recMeta', { recId: this.recId, meetingId: this.meetingId, mime: this.mime, startedAt: Date.now(), elapsed: 0 });
     // Якщо систему чи інший додаток забрав мікрофон — завершуємо запис, щоб записане пішло в обробку.
     const interrupted = () => { if (this.state !== 'stopped' && this.onInterrupted) this.onInterrupted(); };
     this.stream.getAudioTracks().forEach(t => t.addEventListener('ended', interrupted));
     this.mr.onerror = interrupted;
-    this.mr.ondataavailable = async (e) => {
+    this.mr.ondataavailable = (e) => {
       if (!e.data || !e.data.size) return;
       this.chunks.push(e.data);
-      const seq = this.seq++;
-      try {
-        await idb.put('recChunks', { recId: this.recId, seq, blob: e.data });
-        await idb.put('recMeta', { recId: this.recId, meetingId: this.meetingId, mime: this.mime, startedAt: this.firstStart, elapsed: this.elapsed });
-      } catch (err) { console.warn('Не вдалося зберегти шматок запису', err); }
+      this.pending.push({ seq: this.seq++, blob: e.data });
+      this._flush();
     };
+    // Запис стартує одразу; резервна копія на пристрій пишеться у фоні й ніколи не затримує запис.
     this.mr.start(5000);
     this.firstStart = Date.now();
+    this._flush();
     this.startedAt = Date.now();
     this.state = 'recording';
     this._meter();
     this._lock();
     document.addEventListener('visibilitychange', this._onVis);
     this.onState(this.state);
+  }
+
+  async _flush() {
+    if (this.saving) return;
+    this.saving = true;
+    try {
+      await idb.put('recMeta', { recId: this.recId, meetingId: this.meetingId, mime: this.mime, startedAt: this.firstStart || Date.now(), elapsed: this.elapsed });
+      while (this.pending.length) {
+        const c = this.pending[0];
+        await idb.put('recChunks', { recId: this.recId, seq: c.seq, blob: c.blob });
+        this.pending.shift();
+      }
+      if (this.warned && this.onWarn) this.onWarn('Резервна копія запису знову зберігається на пристрій.', 'ok');
+      this.warned = false;
+    } catch (err) {
+      console.warn('Резервна копія запису не зберігається', err);
+      if (!this.warned && this.onWarn) this.onWarn('Запис іде, але резервна копія на пристрій не зберігається. Закрий інші вікна й вкладки з «Нарадами».', 'err');
+      this.warned = true;
+    } finally {
+      this.saving = false;
+    }
   }
 
   async _lock() {
@@ -69,6 +93,7 @@ export class Recorder {
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       this.ac = new AC();
+      if (this.ac.state === 'suspended' && this.ac.resume) this.ac.resume().catch(() => { });
       const src = this.ac.createMediaStreamSource(this.stream);
       const an = this.ac.createAnalyser();
       an.fftSize = 1024;

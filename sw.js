@@ -1,6 +1,6 @@
 // Service worker: офлайн-кеш оболонки додатку і прийом файлів через «Поділитися» на Android.
 
-const VERSION = 'narady-1.1.0';
+const VERSION = 'narady-1.1.1';
 const ASSETS = [
   './', './index.html', './app.css', './manifest.webmanifest',
   './js/app.js', './js/ui.js', './js/api.js', './js/store.js', './js/audio.js', './js/mp3worker.js',
@@ -28,8 +28,9 @@ function openDb() {
       if (!d.objectStoreNames.contains('search')) d.createObjectStore('search', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => { const d = req.result; d.onversionchange = () => d.close(); resolve(d); };
     req.onerror = () => reject(req.error);
+    req.onblocked = () => setTimeout(() => reject(new Error('blocked')), 2500);
   });
 }
 
@@ -45,6 +46,7 @@ async function handleShare(request) {
         files.forEach((f, i) => st.put({ id: 's_' + Date.now() + '_' + i, file: f, name: f.name, type: f.type, lastModified: f.lastModified, size: f.size }));
         tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
       });
+      db.close();
     }
   } catch (e) { /* відкриємо додаток у будь-якому разі */ }
   return Response.redirect(new URL('./#/import', self.registration.scope).href, 303);

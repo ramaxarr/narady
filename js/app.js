@@ -13,7 +13,7 @@ import { downloadFile } from './drive.js';
 import { taskCard, editTask, sortTasks, isOverdue, weeklyReport, tasksText as tasksListText } from './tasks.js';
 import { syncIndex, searchAll, queryWords, snippet, highlight } from './search.js';
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -1089,7 +1089,7 @@ async function viewRecord(id) {
 
   mainBtn.onclick = async () => {
     try {
-      const r = new Recorder({ meetingId: m.id, onLevel: level, onState: () => { sync(); updateRecPill(); }, onInterrupted: () => finishRecording('interrupted') });
+      const r = new Recorder({ meetingId: m.id, onLevel: level, onState: () => { sync(); updateRecPill(); }, onInterrupted: () => finishRecording('interrupted'), onWarn: (msg, kind) => toast(msg, kind || 'err', 9000) });
       S.recorder = r; S.recMeetingId = m.id;
       await r.start({ noiseSuppression: !!(c && c.settings.noiseSuppression) });
       sync();

@@ -7,7 +7,10 @@ let dbp = null;
 function db() {
   if (dbp) return dbp;
   dbp = new Promise((resolve, reject) => {
+    let done = false;
     const req = indexedDB.open(DB_NAME, DB_VER);
+    // Інше вікно зі старою версією тримає сховище: не чекаємо вічно, а повідомляємо про помилку.
+    req.onblocked = () => setTimeout(() => { if (!done) { dbp = null; reject(new Error('Сховище на пристрої зайняте іншим вікном «Нарад»')); } }, 2500);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('recChunks')) {
@@ -20,8 +23,14 @@ function db() {
       if (!d.objectStoreNames.contains('search')) d.createObjectStore('search', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv');
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      done = true;
+      const d = req.result;
+      // Коли відкриється новіша версія додатку — відпускаємо сховище, щоб не заважати їй.
+      d.onversionchange = () => { try { d.close(); } catch { } if (dbp) dbp = null; };
+      resolve(d);
+    };
+    req.onerror = () => { done = true; dbp = null; reject(req.error); };
   });
   return dbp;
 }
