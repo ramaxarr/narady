@@ -1,8 +1,8 @@
 // Обробка наради: стиснення → Диск → розпізнавання → підсумок → Google Doc.
 // Прогрес кожної наради видно в її картці навіть якщо перейти на інший екран.
 
-import { prepareAudio } from './audio.js';
-import { uploadBlob, downloadFile } from './drive.js';
+import { prepareAudio, regroup, PIECE_SEC } from './audio.js';
+import { uploadBlob, uploadPieces, downloadFile, driveToken } from './drive.js';
 import { call, loadConfig, getPeople, getGlossary } from './api.js';
 import { transcribe, analyze, ENGINES } from './engines.js';
 import { savePrepared, getPrepared, trimPrepared } from './store.js';
@@ -81,10 +81,49 @@ export function speakerNamer(meeting, engine, people) {
   };
 }
 
+// Для обробки на пристрої 5-хв частини склеюємо у фрагменти до ~20 хв — менше запитів.
+function forDevice(p) { return p.pieces ? { ...p, chunks: regroup(p.pieces) } : p; }
+
+function baseName(meeting) {
+  const d = new Date(meeting.start);
+  return `${ymd(d)} ${fmtTime(d).replace(':', '.')} ${meeting.title || 'Нарада'}`.replace(/[\\/:*?"<>|]/g, ' ');
+}
+
+/** Аудіо наради одним файлом (для програвача): з пам'яті пристрою або з Диска. */
+export async function audioBlob(meeting, onProgress) {
+  const p = await getPrepared(meeting.id);
+  if (p && p.fileId === meeting.audioFileId && p.full) return p.full;
+  const pieces = meeting.audioPieces || [];
+  if (pieces.length > 1) {
+    const auth = await driveToken();
+    const parts = [];
+    for (let i = 0; i < pieces.length; i++) parts.push(await downloadFile(pieces[i].id, (f) => onProgress && onProgress((i + f) / pieces.length), auth));
+    return new Blob(parts, { type: 'audio/mpeg' });
+  }
+  return downloadFile(meeting.audioFileId, onProgress);
+}
+
 async function loadPrepared(meeting, job) {
   let prepared = await getPrepared(meeting.id);
-  if (prepared && prepared.fileId === meeting.audioFileId) return prepared;
+  if (prepared && prepared.fileId === meeting.audioFileId) return forDevice(prepared);
   if (!meeting.audioFileId) throw new Error('У наради ще немає аудіо');
+  const list = meeting.audioPieces || [];
+  if (list.length) {
+    // Запис лежить на Диску частинами — просто склеюємо, перекодовувати не треба.
+    job.add('dl', 'Аудіо з Google Диска');
+    job.set('dl', { status: 'run' });
+    const auth = await driveToken();
+    const pieces = [];
+    for (let i = 0; i < list.length; i++) {
+      const blob = await downloadFile(list[i].id, (f) => job.set('dl', { progress: (i + f) / list.length }), auth);
+      pieces.push({ blob, offset: list[i].o, duration: list[i].d });
+    }
+    const last = list[list.length - 1];
+    prepared = { full: new Blob(pieces.map(p => p.blob), { type: 'audio/mpeg' }), pieces, duration: last.o + last.d, fileId: meeting.audioFileId };
+    job.set('dl', { status: 'ok', progress: null });
+    await savePrepared(meeting.id, prepared);
+    return forDevice(prepared);
+  }
   job.add('dl', 'Аудіо з Google Диска');
   job.set('dl', { status: 'run' });
   const blob = await downloadFile(meeting.audioFileId, (f) => job.set('dl', { progress: f }));
@@ -100,31 +139,45 @@ async function loadPrepared(meeting, job) {
 
 /**
  * Новий запис або файл з диктофона: стиснути, зберегти на Диск, за бажанням одразу розпізнати.
+ * pieces — зберігати на Диск частинами по ~5 хв (скрипт версії 1.2.0+), щоб їх міг обробити скрипт у фоні.
+ * background — розпізнавання й підсумок робить скрипт Google; додаток після завантаження можна закрити.
  */
-export async function processAudio(meeting, blob, { fileName, engines = [], analyzeAfter = true, onDone, onUploaded } = {}) {
+export async function processAudio(meeting, blob, { fileName, engines = [], analyzeAfter = true, onDone, onUploaded, pieces = false, background = false } = {}) {
   const job = new Job(meeting.id);
+  const bg = !!(background && pieces && engines.length);
+  job.bg = bg;
   try {
     job.add('prep', 'Стиснення аудіо');
     job.add('up', 'Збереження на Google Диск');
     job.set('prep', { status: 'run', detail: 'Читаю файл…' });
     const prepared = await prepareAudio(blob, (stage, f) => {
       job.set('prep', { detail: stage === 'decode' ? 'Читаю файл…' : 'Стискаю…', progress: stage === 'encode' ? f : null });
-    });
+    }, pieces ? { chunkSec: PIECE_SEC, searchSec: 15 } : {});
     job.set('prep', { status: 'ok', progress: null, detail: `${Math.round(prepared.duration / 60)} хв, ${(prepared.full.size / 1048576).toFixed(1)} МБ` });
 
     job.set('up', { status: 'run' });
-    const d = new Date(meeting.start);
-    const name = `${d.toISOString().slice(0, 10)} ${fmtTime(d).replace(':', '.')} ${meeting.title}.mp3`.replace(/[\\/:*?"<>|]/g, ' ');
-    const file = await uploadBlob(prepared.full, name, meeting.id, (f) => job.set('up', { progress: f }));
-    prepared.fileId = file.id;
-    await savePrepared(meeting.id, prepared);
-    trimPrepared();
-    let m = await call('attachAudio', { meetingId: meeting.id, fileId: file.id, name: fileName || name, durationSec: prepared.duration });
+    const name = baseName(meeting);
+    let m, local = prepared;
+    if (pieces) {
+      const list = await uploadPieces(prepared.chunks, name, meeting.id, (f, i, n) => job.set('up', { progress: f, detail: n > 1 ? `частина ${i + 1} з ${n}` : '' }));
+      local = { full: prepared.full, pieces: prepared.chunks, duration: prepared.duration, fileId: list[0].id };
+      await savePrepared(meeting.id, local);
+      trimPrepared();
+      m = await call('attachAudio', { meetingId: meeting.id, pieces: list, name: fileName || name + '.mp3', durationSec: prepared.duration });
+      local = forDevice(local);
+    } else {
+      const file = await uploadBlob(prepared.full, name + '.mp3', meeting.id, (f) => job.set('up', { progress: f }));
+      prepared.fileId = file.id;
+      await savePrepared(meeting.id, prepared);
+      trimPrepared();
+      m = await call('attachAudio', { meetingId: meeting.id, fileId: file.id, name: fileName || name + '.mp3', durationSec: prepared.duration });
+    }
     job.meeting = m;
-    job.set('up', { status: 'ok', progress: null });
+    job.set('up', { status: 'ok', progress: null, detail: '' });
     if (onUploaded) { try { await onUploaded(m); } catch { } }
 
-    if (engines.length) m = await runEngines(m, prepared, engines, job, analyzeAfter);
+    if (bg) m = await queueStep(m, { engines, analyzeAfter }, job);
+    else if (engines.length) m = await runEngines(m, local, engines, job, analyzeAfter);
     job.finish();
     if (onDone) onDone(m);
     return m;
@@ -135,12 +188,67 @@ export async function processAudio(meeting, blob, { fileName, engines = [], anal
   }
 }
 
+/* ---------- Фонова обробка (скрипт Google) ---------- */
+
+let kicking = false, kickPauseUntil = 0;
+/** Просимо скрипт обробляти чергу зараз, не чекаючи тригера. Поки додаток відкритий — так швидше. */
+export function kickQueue() {
+  if (kicking || Date.now() < kickPauseUntil) return;
+  kicking = true;
+  call('runQueue')
+    .then((r) => { if (r && r.busy) kickPauseUntil = Date.now() + 30000; })
+    .catch(() => { kickPauseUntil = Date.now() + 30000; })
+    .finally(() => { kicking = false; });
+}
+
+async function queueStep(meeting, opts, job) {
+  job.add('queue', 'Передача у фонову обробку');
+  job.set('queue', { status: 'run' });
+  await call('queueJob', { meetingId: meeting.id, ...opts });
+  kickQueue();
+  job.set('queue', { status: 'ok', detail: 'Далі все робить скрипт Google — додаток можна закрити.' });
+  job.background = true;
+  const m = { ...meeting, status: 'processing' };
+  job.meeting = m;
+  return m;
+}
+
+/** Старий запис (одним файлом) ріжемо на 5-хв частини, щоб його міг обробити скрипт. */
+async function toPieces(meeting, job) {
+  job.add('dl', 'Аудіо з Google Диска');
+  job.set('dl', { status: 'run' });
+  const blob = await downloadFile(meeting.audioFileId, (f) => job.set('dl', { progress: f }));
+  job.set('dl', { status: 'ok', progress: null });
+  job.add('prep', 'Нарізка на частини по 5 хв');
+  job.set('prep', { status: 'run' });
+  const p = await prepareAudio(blob, (stage, f) => job.set('prep', { progress: stage === 'encode' ? f : null }), { isArchive: true, chunkSec: PIECE_SEC, searchSec: 15 });
+  job.set('prep', { status: 'ok', progress: null, detail: p.chunks.length + ' част.' });
+  let list;
+  if (p.chunks.length === 1) list = [{ id: meeting.audioFileId, o: 0, d: Math.round(p.duration * 100) / 100 }];
+  else {
+    job.add('up', 'Збереження частин на Google Диск');
+    job.set('up', { status: 'run' });
+    list = await uploadPieces(p.chunks, baseName(meeting), meeting.id, (f, i, n) => job.set('up', { progress: f, detail: `частина ${i + 1} з ${n}` }));
+    job.set('up', { status: 'ok', progress: null, detail: '' });
+  }
+  const m = await call('attachAudio', { meetingId: meeting.id, pieces: list, name: meeting.audioName || '', durationSec: p.duration });
+  await savePrepared(meeting.id, { full: blob, pieces: p.chunks, duration: p.duration, fileId: list[0].id });
+  return m;
+}
+
 /** Розпізнати вже збережений запис обраними двигунами. */
-export async function runTranscription(meeting, engines, { analyzeAfter = true, onDone } = {}) {
+export async function runTranscription(meeting, engines, { analyzeAfter = true, onDone, background = false } = {}) {
   const job = new Job(meeting.id);
+  job.bg = background;
   try {
-    const prepared = await loadPrepared(meeting, job);
-    const m = await runEngines(meeting, prepared, engines, job, analyzeAfter);
+    let m;
+    if (background) {
+      const src = meeting.audioPieces && meeting.audioPieces.length ? meeting : await toPieces(meeting, job);
+      m = await queueStep(src, { engines, analyzeAfter }, job);
+    } else {
+      const prepared = await loadPrepared(meeting, job);
+      m = await runEngines(meeting, prepared, engines, job, analyzeAfter);
+    }
     job.finish();
     if (onDone) onDone(m);
     return m;
@@ -152,11 +260,16 @@ export async function runTranscription(meeting, engines, { analyzeAfter = true, 
 }
 
 /** Лише підсумок (і документ) на основі вже готового тексту. */
-export async function runAnalysis(meeting, { engine, onDone } = {}) {
+export async function runAnalysis(meeting, { engine, onDone, background = false } = {}) {
   const job = new Job(meeting.id);
+  job.bg = background;
   try {
-    const transcripts = await call('getTranscripts', { meetingId: meeting.id });
-    const m = await analyzeStep(meeting, transcripts, job, engine);
+    let m;
+    if (background) m = await queueStep(meeting, { engines: [], analyzeOnly: true, analysisEngine: engine }, job);
+    else {
+      const transcripts = await call('getTranscripts', { meetingId: meeting.id });
+      m = await analyzeStep(meeting, transcripts, job, engine);
+    }
     job.finish();
     if (onDone) onDone(m);
     return m;

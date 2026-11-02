@@ -4,6 +4,7 @@
 export const SR = 16000;
 export const KBPS = 32;
 export const CHUNK_SEC = 1200; // фрагменти ~20 хв: вміщаються в ліміти всіх двигунів
+export const PIECE_SEC = 300;  // частини по ~5 хв для фонової обробки скриптом Google
 
 const AC = () => window.AudioContext || window.webkitAudioContext;
 
@@ -111,19 +112,20 @@ export function encodeMp3(pcmSlice, sr, gain, onProgress) {
 /**
  * Готує запис до розпізнавання.
  * Повертає { full: Blob (mp3 усього запису), chunks: [{blob, offset, duration}], duration }.
+ * chunkSec — довжина частин (20 хв для обробки на пристрої, 5 хв для фонової).
  * Якщо передано вже стиснений архів (з Диска), він лишається як є, а нарізка робиться лише за потреби.
  */
-export async function prepareAudio(blob, onProgress = () => { }, { isArchive = false } = {}) {
+export async function prepareAudio(blob, onProgress = () => { }, { isArchive = false, chunkSec = CHUNK_SEC, searchSec = 30 } = {}) {
   onProgress('decode', 0);
   const { pcm, sampleRate, duration } = await decodeMono16k(blob);
   if (duration < 1) throw new Error('Запис порожній або надто короткий');
   onProgress('decode', 1);
 
-  if (isArchive && duration <= CHUNK_SEC + 90) {
+  if (isArchive && duration <= chunkSec + (chunkSec >= 600 ? 90 : 60)) {
     return { full: blob, chunks: [{ blob, offset: 0, duration }], duration };
   }
   const gain = isArchive ? 1 : computeGain(pcm);
-  const cuts = findCuts(pcm, sampleRate);
+  const cuts = findCuts(pcm, sampleRate, chunkSec, searchSec);
   const chunks = [];
   for (let i = 0; i < cuts.length - 1; i++) {
     const a = cuts[i], b = cuts[i + 1];
@@ -134,6 +136,21 @@ export async function prepareAudio(blob, onProgress = () => { }, { isArchive = f
   onProgress('encode', 1);
   const full = isArchive ? blob : new Blob(chunks.map(c => c.blob), { type: 'audio/mpeg' });
   return { full, chunks, duration };
+}
+
+/** Склеює сусідні 5-хв частини у фрагменти до ~20 хв — для обробки на пристрої (менше запитів). */
+export function regroup(pieces, maxSec = CHUNK_SEC + 90) {
+  const out = [];
+  let cur = null;
+  for (const p of pieces) {
+    if (cur && cur.duration + p.duration <= maxSec) {
+      cur.parts.push(p.blob); cur.duration = p.offset + p.duration - cur.offset;
+    } else {
+      cur = { parts: [p.blob], offset: p.offset, duration: p.duration };
+      out.push(cur);
+    }
+  }
+  return out.map(c => ({ blob: c.parts.length === 1 ? c.parts[0] : new Blob(c.parts, { type: 'audio/mpeg' }), offset: c.offset, duration: c.duration }));
 }
 
 export function blobToBase64(blob) {

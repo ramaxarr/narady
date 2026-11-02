@@ -6,14 +6,13 @@ import {
 } from './ui.js';
 import * as api from './api.js';
 import { ENGINES, ANALYZERS, transcriptAsText } from './engines.js';
-import { processAudio, runTranscription, runAnalysis, onJobs, jobFor, clearJob, speakerNamer, anyJobRunning } from './pipeline.js';
+import { processAudio, runTranscription, runAnalysis, onJobs, jobFor, clearJob, speakerNamer, anyJobRunning, kickQueue, audioBlob } from './pipeline.js';
 import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from './recorder.js';
-import { idb, getPrepared } from './store.js';
-import { downloadFile } from './drive.js';
+import { idb } from './store.js';
 import { taskCard, editTask, sortTasks, isOverdue, weeklyReport, tasksText as tasksListText } from './tasks.js';
 import { syncIndex, searchAll, queryWords, snippet, highlight } from './search.js';
 
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.2.0';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -117,7 +116,7 @@ function badges(m) {
   if (m.engines && m.engines.length) b.push(h('span', { class: 'badge' }, 'текст' + (m.engines.length > 1 ? ' ×' + m.engines.length : '')));
   if (m.status === 'analyzed' || m.docId) b.push(h('span', { class: 'badge ok' }, 'підсумок'));
   const j = m.id && jobFor(m.id);
-  if (j && j.running) b.push(h('span', { class: 'badge run' }, 'обробка…'));
+  if ((j && j.running) || m.status === 'processing') b.push(h('span', { class: 'badge run' }, 'обробка…'));
   return b;
 }
 
@@ -366,8 +365,13 @@ function renderMeeting(m, focus) {
     m.notes ? h('p', { class: 'notes' }, m.notes) : null));
 
   if (m.status !== 'analyzed' && backendAtLeast('1.1.0')) root.appendChild(agendaBox(m));
-  const jobBox = m.id ? jobPanel(m.id, (j) => { if (alive(t) && j.meeting) { S.meetings.set(j.meeting.id, j.meeting); clear(view); renderMeeting(j.meeting); } }) : h('div');
+  // Після передачі у фон локальні кроки (стиснення, завантаження) вже не цікаві — далі показує панель фонової обробки.
+  const lj = m.id && jobFor(m.id);
+  if (lj && !lj.running && lj.background && !lj.error) clearJob(m.id);
+  const rerender = (fresh) => { if (alive(t) && fresh) { S.meetings.set(fresh.id, fresh); clear(view); renderMeeting(fresh); } };
+  const jobBox = m.id ? jobPanel(m.id, (j) => rerender(j.meeting)) : h('div');
   root.appendChild(jobBox);
+  if (m.id && backendAtLeast('1.2.0')) root.appendChild(serverJobPanel(m, rerender));
   root.appendChild(audioPanel(m));
   const tabsHost = h('div', { class: 'tabs-host' });
   root.appendChild(tabsHost);
@@ -693,12 +697,13 @@ function audioPanel(m) {
     if (!await confirmDialog('Замінити аудіо цієї наради? Старий файл піде в кошик Google Диска, а наявні тексти лишаться.', 'Замінити')) return;
     startProcessing(m, file, { fileName: file.name });
   } });
+  const busy = m.status === 'processing';
   put(box, 
     h('div', { class: 'row wrap' },
       h('button', { class: 'btn', onclick: () => loadPlayer(m, playerHost) }, icon('play'), 'Слухати'),
       h('div', { class: 'grow' }, h('b', null, fmtDuration(m.durationSec)), h('div', { class: 'hint ellipsis' }, m.audioName || 'аудіо')),
-      h('button', { class: 'btn primary', onclick: () => chooseEnginesFlow(m) }, 'Розпізнати…'),
-      h('button', { class: 'btn ghost small', onclick: () => fileIn.click() }, 'Замінити')),
+      busy ? null : h('button', { class: 'btn primary', onclick: () => chooseEnginesFlow(m) }, 'Розпізнати…'),
+      busy ? null : h('button', { class: 'btn ghost small', onclick: () => fileIn.click() }, 'Замінити')),
     playerHost, fileIn);
   return box;
 }
@@ -707,10 +712,7 @@ async function loadPlayer(m, host) {
   if (S.player && host.contains(S.player)) { S.player.play(); return; }
   put(clear(host), spinner('Завантажую аудіо…'));
   try {
-    let blob = null;
-    const p = await getPrepared(m.id);
-    if (p && p.fileId === m.audioFileId) blob = p.full;
-    if (!blob) blob = await downloadFile(m.audioFileId);
+    const blob = await audioBlob(m);
     const a = h('audio', { controls: true, preload: 'auto', src: URL.createObjectURL(blob) });
     put(clear(host), a);
     S.player = a;
@@ -760,7 +762,9 @@ function jobPanel(meetingId, onFinished) {
           s.status === 'run' && j.canSkip(s.id) && s.startedAt && Date.now() - s.startedAt > 45000
             ? h('button', { class: 'btn small ghost skip', onclick: () => j.skip(s.id) }, 'Пропустити — не чекати цей двигун') : null)))),
       j.running && resumedNote ? h('div', { class: 'banner warn small' }, 'Поки додаток був згорнутий, Android міг призупинити обробку. Тримай «Наради» відкритими до кінця — екран не гасне сам.') : null,
-      j.running ? h('p', { class: 'hint' }, 'Не закривай і не згортай додаток до завершення — екран лишатиметься увімкненим.') : null);
+      j.running ? h('p', { class: 'hint' }, j.bg
+        ? 'Не закривай додаток, доки запис не завантажиться на Диск. Далі обробка піде у фоні — тоді вже можна.'
+        : 'Не закривай і не згортай додаток до завершення — екран лишатиметься увімкненим.') : null);
   };
   // Щосекунди оновлюємо лише час кроків (повне перемальовування заважало б натискати кнопки).
   const tick = setInterval(() => {
@@ -790,24 +794,127 @@ function jobPanel(meetingId, onFinished) {
   return box;
 }
 
+/* ---------- фонова обробка (на боці Google) ---------- */
+
+const SJ_DONE = new Map(); // нарада → щойно завершена фонова обробка з помилками (щоб показати після оновлення картки)
+const isActive = (j) => !!j && (j.status === 'queued' || j.status === 'running');
+const jobHasProblems = (j) => !!j && (j.status === 'error' || j.engines.some(e => e.status === 'error') || j.analysis.status === 'error' || j.doc.status === 'error');
+function jobSeen(id) { try { return (localStorage.getItem('narady.jobsSeen') || '').split(',').includes(id); } catch { return false; } }
+function markJobSeen(id) { try { const a = (localStorage.getItem('narady.jobsSeen') || '').split(',').filter(Boolean).slice(-30); a.push(id); localStorage.setItem('narady.jobsSeen', a.join(',')); } catch { } }
+
+function serverJobPanel(m, onChange) {
+  const box = h('div', { class: 'job card bgjob' });
+  box.hidden = true;
+  let job = SJ_DONE.get(m.id) || null;
+  let polling = m.status === 'processing';
+  let busyAction = false;
+  const sinceIso = (a, b) => { if (!a) return ''; const sec = ((b ? Date.parse(b) : Date.now()) - Date.parse(a)) / 1000; return sec >= 1 ? fmtDuration(sec) : ''; };
+  const cls = { done: 'ok', error: 'err', running: 'run', queued: 'wait', skip: 'wait', cancelled: 'wait' };
+  const icons = { ok: '✓', err: '!', run: '', wait: '·' };
+  const row = (label, status, detail, time, progress) => h('li', { class: 'step ' + cls[status] },
+    h('span', { class: 'st-ic' }, icons[cls[status]]),
+    h('div', { class: 'grow' },
+      h('div', { class: 'row between' }, h('span', null, label), h('span', { class: 'hint st-time' }, time || '')),
+      detail ? h('div', { class: 'hint' }, detail) : null,
+      progress != null ? h('div', { class: 'bar' }, h('i', { style: { width: Math.round(progress * 100) + '%' } })) : null));
+
+  const draw = () => {
+    clear(box);
+    const active = isActive(job);
+    box.hidden = !job || (!active && (!jobHasProblems(job) || jobSeen(job.id)));
+    if (box.hidden) return;
+    const rows = job.engines.map(e => row('Розпізнавання: ' + (e.name || e.id), e.status,
+      e.status === 'error' ? e.error : e.status === 'queued' ? 'у черзі' : e.detail,
+      sinceIso(e.startedAt, e.endedAt),
+      e.status === 'running' && e.total > 1 ? e.done / e.total : null));
+    if (job.analysis.status !== 'skip') rows.push(row('Підсумок і задачі', job.analysis.status,
+      job.analysis.status === 'error' ? job.analysis.error : job.analysis.status === 'done' ? job.analysis.tasks + ' задач' : job.analysis.detail));
+    if (job.doc.status !== 'skip' && job.analysis.status !== 'error') rows.push(row('Google Doc', job.doc.status, job.doc.error));
+    const stale = active && job.updatedAt && Date.now() - Date.parse(job.updatedAt) > 4 * 60000;
+    put(box,
+      h('div', { class: 'job-head' }, active ? h('span', { class: 'spin' }) : null,
+        h('b', null, active ? (job.status === 'queued' ? 'У черзі на фонову обробку' : 'Обробка у фоні') : 'Фонову обробку завершено з помилками'),
+        active ? h('span', { class: 'hint' }, sinceIso(job.createdAt)) : h('button', { class: 'btn small ghost', onclick: () => { markJobSeen(job.id); SJ_DONE.delete(m.id); draw(); } }, 'Сховати')),
+      h('ul', { class: 'steps' }, rows),
+      active ? h('p', { class: 'hint' }, job.status === 'queued'
+        ? 'Скрипт Google візьме нараду в роботу протягом хвилини. Додаток можна закрити — обробка не зупиниться.'
+        : 'Обробка йде на боці Google — додаток можна закрити або згорнути. Результат зʼявиться тут сам.') : null,
+      stale ? h('div', { class: 'banner warn small' }, 'Давно немає змін — підганяю обробку. Якщо так і лишиться, скасуй і запусти ще раз.') : null,
+      active ? h('div', { class: 'row' }, h('button', { class: 'btn small ghost', disabled: busyAction, onclick: cancel }, 'Скасувати обробку')) : null);
+  };
+
+  const cancel = async () => {
+    if (!await confirmDialog('Зупинити фонову обробку? Те, що вже розпізнано повністю, лишиться.', 'Зупинити')) return;
+    busyAction = true; draw();
+    try { const fresh = await api.call('cancelJob', { meetingId: m.id }); polling = false; SJ_DONE.delete(m.id); toast('Обробку зупинено', 'ok'); onChange(fresh); }
+    catch (e) { toast(e.message, 'err'); busyAction = false; draw(); }
+  };
+
+  const finished = async () => {
+    polling = false;
+    if (job.status === 'cancelled') toast('Фонову обробку скасовано');
+    else if (jobHasProblems(job)) { SJ_DONE.set(m.id, job); toast('Фонову обробку завершено, але не все вдалося — подробиці в картці наради.', 'err', 7000); }
+    else { SJ_DONE.delete(m.id); toast('Нараду оброблено', 'ok'); }
+    try { onChange(await api.call('getMeeting', { id: m.id })); } catch { draw(); }
+  };
+
+  const poll = async () => {
+    if (!box.isConnected) return;
+    if (document.visibilityState === 'hidden') { setTimeout(poll, 4000); return; }
+    try {
+      const j = await api.call('jobStatus', { meetingId: m.id });
+      if (!box.isConnected) return;
+      const was = isActive(job) || polling;
+      job = j;
+      if (isActive(job)) { kickQueue(); draw(); setTimeout(poll, 4000); return; }
+      draw();
+      if (was && job && m.status === 'processing') finished();
+      // Нарада позначена «обробляється», а завдання немає — повертаємо їй звичайний стан.
+      else if (!job && m.status === 'processing') onChange(await api.call('cancelJob', { meetingId: m.id }));
+    } catch (e) {
+      if (box.isConnected && polling) setTimeout(poll, 8000);
+    }
+  };
+
+  if (job) draw();
+  // Картку щойно відкрили: якщо йде фонова обробка — стежимо за нею; якщо ні — перевіряємо, чи остання не завершилась з помилками.
+  if (polling || m.audioFileId) setTimeout(poll, 0);
+  return box;
+}
+
 async function startProcessing(m, blob, { fileName, onUploaded } = {}) {
   const choice = await chooseEngines(m, { title: 'Що робити з записом?', okLabel: 'Почати', allowNone: true });
   if (!choice) return;
   if (location.hash !== '#/m/' + encodeURIComponent(m.id)) go('#/m/' + encodeURIComponent(m.id));
   else { clear(view); renderMeeting(m); }
-  processAudio(m, blob, { fileName, engines: choice.engines, analyzeAfter: choice.analyzeAfter, onUploaded })
-    .then((r) => { S.meetings.set(r.id, r); toast('Нараду оброблено', 'ok'); })
+  processAudio(m, blob, { fileName, engines: choice.engines, analyzeAfter: choice.analyzeAfter, onUploaded, pieces: backendAtLeast('1.2.0'), background: choice.background })
+    .then((r) => {
+      S.meetings.set(r.id, r);
+      if (r.status === 'processing') toast('Запис на Диску. Далі обробка йде у фоні — додаток можна закрити.', 'ok', 6000);
+      else toast(choice.engines.length ? 'Нараду оброблено' : 'Запис збережено на Диск', 'ok');
+    })
     .catch((e) => toast(e.message, 'err', 7000));
 }
 
+function busyInBackground(m) {
+  if (m.status !== 'processing') return false;
+  toast('Ця нарада ще обробляється у фоні — дочекайся завершення або скасуй обробку.', 'info', 5000);
+  return true;
+}
+
 async function chooseEnginesFlow(m) {
+  if (busyInBackground(m)) return;
   const choice = await chooseEngines(m, { title: 'Розпізнати запис', okLabel: 'Розпізнати' });
   if (!choice || !choice.engines.length) return;
-  runTranscription(m, choice.engines, { analyzeAfter: choice.analyzeAfter })
-    .then((r) => { S.meetings.set(r.id, r); toast('Готово', 'ok'); })
+  runTranscription(m, choice.engines, { analyzeAfter: choice.analyzeAfter, background: choice.background })
+    .then((r) => { S.meetings.set(r.id, r); toast(r.status === 'processing' ? 'Передано у фонову обробку — додаток можна закрити.' : 'Готово', 'ok', 5000); })
     .catch((e) => toast(e.message, 'err', 7000));
   clear(view); renderMeeting(m);
 }
+
+// Де обробляти: у фоні (скрипт Google) чи на цьому пристрої. Вибір запамʼятовується на пристрої.
+function bgPref() { try { return localStorage.getItem('narady.bg') !== '0'; } catch { return true; } }
+function setBgPref(v) { try { localStorage.setItem('narady.bg', v ? '1' : '0'); } catch { } }
 
 async function chooseEngines(m, { title, okLabel, allowNone = false }) {
   let c;
@@ -829,6 +936,8 @@ async function chooseEngines(m, { title, okLabel, allowNone = false }) {
   }));
   const an = h('input', { type: 'checkbox', checked: c.settings.autoAnalyze });
   const anName = (ANALYZERS[c.settings.analysisEngine] || ANALYZERS.gemini).name;
+  const canBg = backendAtLeast('1.2.0');
+  const bg = h('input', { type: 'checkbox', checked: canBg && bgPref() });
   return new Promise((resolve) => {
     let resolved = false;
     modal({
@@ -837,6 +946,8 @@ async function chooseEngines(m, { title, okLabel, allowNone = false }) {
         h('p', { class: 'hint' }, 'Можна обрати кілька — тексти стануть поруч для порівняння.'),
         list,
         h('label', { class: 'check' }, an, ` Після розпізнавання зробити підсумок і задачі (${anName})`),
+        canBg ? h('label', { class: 'check' }, bg, ' Обробляти у фоні — після завантаження на Диск додаток можна закрити') : null,
+        canBg ? h('p', { class: 'hint' }, 'Без цієї галочки обробка йде на цьому пристрої, і додаток треба тримати відкритим до кінця.') : null,
         allowNone ? h('p', { class: 'hint' }, 'Якщо нічого не обрати — запис просто збережеться на Диск.') : null),
       actions: [
         { label: 'Скасувати', onClick: () => { resolved = true; resolve(null); } },
@@ -844,7 +955,8 @@ async function chooseEngines(m, { title, okLabel, allowNone = false }) {
           label: okLabel, kind: 'primary', onClick: () => {
             const engines = Object.keys(boxes).filter(id => boxes[id].checked);
             if (!engines.length && !allowNone) { toast('Обери хоча б один двигун'); return false; }
-            resolved = true; resolve({ engines, analyzeAfter: an.checked });
+            if (canBg) setBgPref(bg.checked);
+            resolved = true; resolve({ engines, analyzeAfter: an.checked, background: canBg && bg.checked });
           }
         }
       ],
@@ -854,6 +966,7 @@ async function chooseEngines(m, { title, okLabel, allowNone = false }) {
 }
 
 async function analyzeFlow(m) {
+  if (busyInBackground(m)) return;
   const c = await api.loadConfig();
   const sel = h('select', { class: 'input' }, Object.values(ANALYZERS).map(a => h('option', { value: a.id, disabled: !c.keys[a.keyName] }, a.name + (c.keys[a.keyName] ? '' : ' — немає ключа'))));
   sel.value = c.settings.analysisEngine;
@@ -866,7 +979,10 @@ async function analyzeFlow(m) {
       { label: 'Скасувати' },
       {
         label: 'Зробити', kind: 'primary', onClick: () => {
-          runAnalysis(m, { engine: sel.value }).then((r) => { S.meetings.set(r.id, r); toast('Підсумок готовий', 'ok'); }).catch((e) => toast(e.message, 'err', 7000));
+          const background = backendAtLeast('1.2.0') && bgPref();
+          runAnalysis(m, { engine: sel.value, background })
+            .then((r) => { S.meetings.set(r.id, r); if (!background) toast('Підсумок готовий', 'ok'); })
+            .catch((e) => toast(e.message, 'err', 7000));
           clear(view); renderMeeting(m);
         }
       }

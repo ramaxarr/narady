@@ -7,8 +7,8 @@ export async function driveToken(meetingId) {
   return call('driveToken', { meetingId });
 }
 
-export async function uploadBlob(blob, name, meetingId, onProgress) {
-  const { token, folderId } = await driveToken(meetingId);
+export async function uploadBlob(blob, name, meetingId, onProgress, auth) {
+  const { token, folderId } = auth || await driveToken(meetingId);
   const type = blob.type || 'audio/mpeg';
   const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size', {
     method: 'POST',
@@ -42,8 +42,27 @@ export async function uploadBlob(blob, name, meetingId, onProgress) {
   return file;
 }
 
-export async function downloadFile(fileId, onProgress) {
-  const { token } = await driveToken();
+/** Кілька файлів (частини запису) з одним токеном; спроба повторюється один раз. */
+export async function uploadPieces(pieces, baseName, meetingId, onProgress) {
+  const auth = await driveToken(meetingId);
+  const total = pieces.reduce((a, p) => a + p.blob.size, 0) || 1;
+  let done = 0;
+  const out = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const p = pieces[i];
+    const name = pieces.length > 1 ? `${baseName} — ${String(i + 1).padStart(2, '0')}.mp3` : `${baseName}.mp3`;
+    const prog = (f) => onProgress && onProgress((done + f * p.blob.size) / total, i, pieces.length);
+    let file;
+    try { file = await uploadBlob(p.blob, name, meetingId, prog, auth); }
+    catch (e) { await new Promise(r => setTimeout(r, 3000)); file = await uploadBlob(p.blob, name, meetingId, prog, auth); }
+    done += p.blob.size;
+    out.push({ id: file.id, o: Math.round(p.offset * 100) / 100, d: Math.round(p.duration * 100) / 100 });
+  }
+  return out;
+}
+
+export async function downloadFile(fileId, onProgress, auth) {
+  const { token } = auth || await driveToken();
   const res = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
     headers: { Authorization: 'Bearer ' + token }
   });
