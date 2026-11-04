@@ -7,7 +7,7 @@
  * Потім: Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
  */
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const SHEETS = { meetings: 'Наради', people: 'Люди', glossary: 'Словник', series: 'Серії', tasks: 'Задачі' };
 const M_COLS = ['id', 'eventId', 'title', 'start', 'end', 'participants', 'notes', 'folderId',
   'audioFileId', 'audioName', 'durationSec', 'engines', 'primaryEngine', 'speakerMap',
@@ -981,6 +981,9 @@ const DEFAULT_SETTINGS_GS = {
   analysisModels: { gemini: 'gemini-2.5-flash', openai: 'gpt-5-mini', anthropic: 'claude-sonnet-5-5' }
 };
 const RUN_BUDGET_MS = 240000;   // після 4 хв нових кроків не починаємо
+const ELEVEN_WHOLE_MAX_SEC = 5400;       // ElevenLabs: весь запис одним завданням (довші — частинами по ≤ 90 хв)
+const ELEVEN_POLL_MS = 15000;            // як часто питати ElevenLabs, чи готовий текст
+const ELEVEN_ASYNC_MAX_MS = 15 * 60000;  // скільки максимум чекати на результат
 const RETRY_WAITS = [15000, 30000, 60000];
 const WEEKDAYS_UK = ['неділя', 'понеділок', 'вівторок', 'середа', 'четвер', 'пʼятниця', 'субота'];
 
@@ -1026,7 +1029,10 @@ function queueJob_(a) {
       id: newId_('j_'), meetingId: row.id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       status: 'queued', primaryBefore: row.primaryEngine || '', analysisEngine: a.analysisEngine || '',
       engines: engines.map(function (id) {
-        return { id: id, status: 'queued', done: 0, total: groupsFor_(id, audio).length, segs: [], warnings: [], attempts: 0, nextAt: 0, error: '', detail: '' };
+        const e = { id: id, status: 'queued', done: 0, total: 0, segs: [], warnings: [], attempts: 0, nextAt: 0, error: '', detail: '' };
+        if (id === 'elevenlabs') e.mode = audio.pieces.length > GROUP_SIZE.elevenlabs && elevenAsyncOk_() ? 'whole' : 'parts';
+        e.total = groupsFor_(id, audio, e).length;
+        return e;
       }),
       analysis: { status: analyze ? 'queued' : 'skip', attempts: 0, nextAt: 0, error: '', detail: '' },
       doc: { status: analyze ? 'queued' : 'skip', error: '' }
@@ -1163,9 +1169,17 @@ function stepJob_(meetingId) {
 
   const active = job.engines.filter(function (e) { return e.status === 'queued' || e.status === 'running'; });
   if (active.length) {
-    const ready = active.filter(function (e) { return !(e.nextAt > now); })[0];
+    const readyList = active.filter(function (e) { return !(e.nextAt > now); });
+    // ElevenLabs у режимі «весь запис» — першим: він працює на своєму боці, поки скрипт робить решту.
+    const ready = readyList.filter(function (e) { return e.id === 'elevenlabs' && e.mode === 'whole'; })[0] || readyList[0];
     if (!ready) return Math.min.apply(null, active.map(function (e) { return e.nextAt - now; }));
     engineStep_(job, ready, row, folder);
+    saveJob_(folder, job);
+    return true;
+  }
+
+  if (!job.mapped) {
+    try { job.mapped = autoMapStep_(job, row, folder); } catch (e) { job.mapped = { error: String(e.message || e) }; }
     saveJob_(folder, job);
     return true;
   }
@@ -1201,23 +1215,43 @@ function saveJob_(folder, job) {
   writeJson_(folder, 'job.json', job);
 }
 
-function groupsFor_(id, audio) {
-  const n = GROUP_SIZE[id] || 1, out = [];
+function groupsFor_(id, audio, eng) {
   const pieces = (audio && audio.pieces) || [];
+  const out = [];
+  if (id === 'elevenlabs' && eng && eng.mode === 'whole' && pieces.length) {
+    // Весь запис одним завданням — мітки спікерів однакові від початку до кінця.
+    const last = pieces[pieces.length - 1];
+    const parts = Math.max(1, Math.ceil((last.o + last.d) / ELEVEN_WHOLE_MAX_SEC));
+    const per = Math.ceil(pieces.length / parts);
+    for (let i = 0; i < pieces.length; i += per) out.push(pieces.slice(i, i + per));
+    return out;
+  }
+  const n = GROUP_SIZE[id] || 1;
   for (let i = 0; i < pieces.length; i += n) out.push(pieces.slice(i, i + n));
   return out;
 }
 
+function elevenAsyncOk_() {
+  const off = propJson_('EL_ASYNC_OFF', null);
+  return !(off && Date.now() - Number(off.at || 0) < 7 * 86400000);
+}
+
 function engineStep_(job, eng, row, folder) {
   const audio = readJson_(folder, 'audio.json');
-  const groups = groupsFor_(eng.id, audio);
+  const groups = groupsFor_(eng.id, audio, eng);
   eng.total = groups.length;
   if (eng.status === 'queued') { eng.status = 'running'; eng.startedAt = new Date().toISOString(); }
+  const whole = eng.id === 'elevenlabs' && eng.mode === 'whole';
+  // Попередній запуск обірвався посеред відправки всього запису — більше не ризикуємо, переходимо на частини.
+  if (whole && eng.inflight) { switchToParts_(eng, audio, 'попередня спроба обірвалась'); return; }
   try {
     const ctx = ctxFor_(row);
     const g = groups[eng.done];
     if (!g) throw new Error('Аудіо змінилося під час обробки — запусти розпізнавання ще раз');
+    if (whole && !(eng.async && eng.async.idx === eng.done)) { eng.inflight = true; saveJob_(folder, job); }
     const segs = ENGINE_STEP[eng.id](g, eng.done, groups.length, ctx, eng);
+    eng.inflight = false;
+    if (segs === null) { eng.attempts = 0; eng.nextAt = Date.now() + ELEVEN_POLL_MS; return; } // сервіс ще працює
     eng.segs = eng.segs.concat(segs);
     eng.done++;
     eng.attempts = 0; eng.nextAt = 0;
@@ -1232,8 +1266,14 @@ function engineStep_(job, eng, row, folder) {
       eng.segs = [];
     }
   } catch (e) {
+    eng.inflight = false;
     eng.attempts++;
-    if (e.retryable && eng.attempts <= RETRY_WAITS.length) {
+    const retry = e.retryable && eng.attempts <= RETRY_WAITS.length;
+    if (whole && (e.switchParts || (!retry && e.status !== 401 && e.status !== 403))) {
+      switchToParts_(eng, audio, String(e.message || e).replace(/^ElevenLabs:\s*/, ''));
+      return;
+    }
+    if (retry) {
       eng.nextAt = Date.now() + RETRY_WAITS[eng.attempts - 1];
       eng.detail = String(e.message || e).slice(0, 160) + ' — повтор ' + (eng.attempts + 1) + '…';
     } else {
@@ -1243,6 +1283,35 @@ function engineStep_(job, eng, row, folder) {
       eng.endedAt = new Date().toISOString();
     }
   }
+}
+
+/** ElevenLabs: якщо весь запис одним завданням не вийшло — звичайні частини по ~15 хв. */
+function switchToParts_(eng, audio, why) {
+  eng.mode = 'parts'; eng.done = 0; eng.segs = []; eng.async = null; eng.inflight = false; eng.attempts = 0; eng.nextAt = 0;
+  eng.total = groupsFor_(eng.id, audio, eng).length;
+  eng.warnings.push('Весь запис одним завданням не вийшло (' + String(why || '').slice(0, 200) + '), тому оброблено частинами по ~15 хв.');
+  eng.detail = 'обробка частинами по ~15 хв…';
+}
+
+function switchParts_(msg) { const e = new Error(msg); e.switchParts = true; return e; }
+
+/** Після розпізнавання: мітки спікерів без імен (ElevenLabs, OpenAI) підписуємо іменами з тексту, де вони є (Gemini). */
+function autoMapStep_(job, row, folder) {
+  const sh = sheet_(SHEETS.meetings);
+  const cur = findById_(sh, row.id);
+  const trs = {};
+  parseJson_(cur.engines, []).forEach(function (e) { const t = readJson_(folder, 'transcript_' + e + '.json'); if (t) trs[e] = t; });
+  const pmap = peopleById_();
+  const people = Object.keys(pmap).map(function (k) { return pmap[k]; });
+  const r = spkAutoMapAll(trs, parseJson_(cur.speakerMap, {}) || {}, people, parseJson_(cur.participants, []));
+  const any = Object.keys(r.filled).some(function (e) { return r.filled[e] > 0; });
+  if (any) saveMeetingState_({ meetingId: row.id, speakerMap: r.speakerMap });
+  const refName = r.reference ? ENGINE_NAMES[r.reference] || r.reference : '';
+  job.engines.forEach(function (e) {
+    const n = r.filled[e.id];
+    if (n && e.status === 'done') e.detail = (e.detail ? e.detail + ' · ' : '') + 'імена з ' + refName + ': ' + n;
+  });
+  return { filled: r.filled, coverage: r.coverage, reference: r.reference };
 }
 
 /* ---------- HTTP до сервісів ---------- */
@@ -1256,8 +1325,8 @@ function fetchJson_(name, url, opt) {
     throw err;
   }
   const code = res.getResponseCode(), text = res.getContentText('UTF-8');
-  if (code !== 200) throw httpErr_(name, code, text);
-  return JSON.parse(text);
+  if (code < 200 || code >= 300) throw httpErr_(name, code, text);
+  return text ? JSON.parse(text) : {};
 }
 
 function httpErr_(name, code, text) {
@@ -1281,9 +1350,8 @@ function postForm_(name, url, headers, form) {
 }
 
 function groupBytes_(group) {
-  let bytes = [];
-  group.forEach(function (p) { bytes = bytes.concat(DriveApp.getFileById(p.id).getBlob().getBytes()); });
-  return bytes;
+  const parts = group.map(function (p) { return DriveApp.getFileById(p.id).getBlob().getBytes(); });
+  return parts.length === 1 ? parts[0] : Array.prototype.concat.apply([], parts);
 }
 
 /* ---------- Допоміжне (так само, як у додатку) ---------- */
@@ -1432,40 +1500,104 @@ const ENGINE_STEP = {
   },
 
   elevenlabs: function (group, idx, total, ctx, eng) {
-    const o = group[0].o;
-    const base = [{ name: 'file', bytes: groupBytes_(group), filename: 'audio.mp3', mimeType: 'audio/mpeg' },
-      { name: 'model_id', value: ctx.settings.models.elevenlabs }, { name: 'diarize', value: 'true' },
-      { name: 'timestamps_granularity', value: 'word' }, { name: 'tag_audio_events', value: 'false' }];
-    if (ctx.settings.language === 'uk') base.push({ name: 'language_code', value: 'uk' });
-    const terms = hintTermsGs_(ctx, 100).filter(function (t) { return t.length <= 50; });
-    const url = 'https://api.elevenlabs.io/v1/speech-to-text';
-    let j;
-    try {
-      j = fetchJson_('ElevenLabs', url, postForm_('ElevenLabs', '', { 'xi-api-key': ctx.keys.elevenlabs }, base.concat(terms.map(function (t) { return { name: 'keyterms', value: t }; }))).opt);
-    } catch (e) {
-      if (terms.length && (e.status === 400 || e.status === 422)) {
-        if (eng.warnings.indexOf('Словник не прийнято сервісом, розпізнано без нього.') < 0) eng.warnings.push('Словник не прийнято сервісом, розпізнано без нього.');
-        j = fetchJson_('ElevenLabs', url, postForm_('ElevenLabs', '', { 'xi-api-key': ctx.keys.elevenlabs }, base).opt);
-      } else throw e;
-    }
-    const out = [];
-    let cur = null;
-    (j.words || []).forEach(function (w) {
-      if (w.type === 'audio_event') return;
-      const spk = (total > 1 ? (idx + 1) + '·' : '') + String(w.speaker_id || '');
-      if (w.type === 'spacing') { if (cur) cur.text += w.text; return; }
-      const st = o + (w.start || 0), en = o + (w.end || w.start || 0);
-      const brk = !cur || cur.speaker !== spk || st - cur.end > 2.5 || (cur.text.length > 600 && /[.!?…]\s*$/.test(cur.text));
-      if (brk) { if (cur) out.push(cur); cur = { start: st, end: en, speaker: spk, text: w.text }; }
-      else { cur.text += w.text; cur.end = en; }
-    });
-    if (cur) out.push(cur);
-    if (!(j.words || []).length && j.text) out.push({ start: o, end: o, speaker: '', text: j.text });
-    out.forEach(function (s) { s.text = String(s.text).replace(/\s+/g, ' ').trim(); });
+    if (eng.mode === 'whole') return elevenWholeStep_(group, idx, total, ctx, eng);
+    const j = elevenRequest_(group, ctx, eng, false);
     if (total > 1 && idx === 0) eng.warnings.push('Запис оброблено частинами по ~15 хв: мітки спікерів у різних частинах незалежні.');
-    return out.filter(function (s) { return s.text; });
+    return elevenSegs_(j, group[0].o, idx, total);
   }
 };
+
+function elevenRequest_(group, ctx, eng, async) {
+  const base = [{ name: 'file', bytes: groupBytes_(group), filename: 'audio.mp3', mimeType: 'audio/mpeg' },
+    { name: 'model_id', value: ctx.settings.models.elevenlabs }, { name: 'diarize', value: 'true' },
+    { name: 'timestamps_granularity', value: 'word' }, { name: 'tag_audio_events', value: 'false' }];
+  if (ctx.settings.language === 'uk') base.push({ name: 'language_code', value: 'uk' });
+  if (async) base.push({ name: 'webhook', value: 'true' });
+  const terms = hintTermsGs_(ctx, 100).filter(function (t) { return t.length <= 50; });
+  const url = 'https://api.elevenlabs.io/v1/speech-to-text';
+  const headers = { 'xi-api-key': ctx.keys.elevenlabs };
+  try {
+    return fetchJson_('ElevenLabs', url, postForm_('ElevenLabs', '', headers, base.concat(terms.map(function (t) { return { name: 'keyterms', value: t }; }))).opt);
+  } catch (e) {
+    if (terms.length && (e.status === 400 || e.status === 422)) {
+      const j = fetchJson_('ElevenLabs', url, postForm_('ElevenLabs', '', headers, base).opt);
+      if (eng.warnings.indexOf('Словник не прийнято сервісом, розпізнано без нього.') < 0) eng.warnings.push('Словник не прийнято сервісом, розпізнано без нього.');
+      return j;
+    }
+    throw e;
+  }
+}
+
+/** Весь запис одним завданням: відправляємо без очікування результату, потім питаємо, чи готово. */
+function elevenWholeStep_(group, idx, total, ctx, eng) {
+  const o = group[0].o;
+  const a = eng.async;
+  if (!a || a.idx !== idx) {
+    let j;
+    try { j = elevenRequest_(group, ctx, eng, true); }
+    catch (e) {
+      if (e.status === 400 || e.status === 422) {
+        setProp_('EL_ASYNC_OFF', JSON.stringify({ at: Date.now(), msg: String(e.body || e.message).slice(0, 300) }));
+        throw switchParts_('ElevenLabs не прийняв завдання: ' + String(e.body || e.message).slice(0, 160));
+      }
+      throw e;
+    }
+    if ((j.words && j.words.length) || j.text) return elevenSegs_(j, o, idx, total); // відповів одразу
+    if (!j.transcription_id) throw switchParts_('ElevenLabs не повернув номер завдання');
+    eng.async = { idx: idx, tid: String(j.transcription_id), since: Date.now() };
+    eng.detail = 'ElevenLabs розпізнає ' + (total > 1 ? 'частину ' + (idx + 1) + ' з ' + total : 'весь запис') + '…';
+    return null;
+  }
+  const r = elevenPoll_(a.tid, ctx);
+  if (r === null) {
+    if (Date.now() - a.since > ELEVEN_ASYNC_MAX_MS) {
+      // Результат так і не вдалося забрати — наступні наради одразу обробляємо частинами.
+      setProp_('EL_ASYNC_OFF', JSON.stringify({ at: Date.now(), msg: 'результат не отримано за 15 хв' }));
+      throw switchParts_('ElevenLabs не віддав результат за 15 хв');
+    }
+    return null;
+  }
+  eng.async = null;
+  if (total > 1 && idx === 0) eng.warnings.push('Запис довший за 90 хв оброблено частинами: мітки спікерів у різних частинах незалежні.');
+  return elevenSegs_(r, o, idx, total);
+}
+
+/** Готовий текст завдання або null, якщо ще в роботі. */
+function elevenPoll_(tid, ctx) {
+  let res;
+  try {
+    res = UrlFetchApp.fetch('https://api.elevenlabs.io/v1/speech-to-text/transcripts/' + encodeURIComponent(tid),
+      { method: 'get', headers: { 'xi-api-key': ctx.keys.elevenlabs }, muteHttpExceptions: true });
+  } catch (e) { return null; }
+  const code = res.getResponseCode(), text = res.getContentText('UTF-8');
+  if (code === 200) {
+    let j;
+    try { j = JSON.parse(text); } catch (e) { return null; }
+    if ((j.words && j.words.length) || (j.text && !j.status)) return j;
+    return null;
+  }
+  if (code === 404 || code === 409 || code === 425 || code === 429 || code >= 500) return null;
+  if (code === 400 || code === 422) throw switchParts_('ElevenLabs не віддав результат: ' + String(text).slice(0, 160));
+  throw httpErr_('ElevenLabs', code, text);
+}
+
+function elevenSegs_(j, o, idx, total) {
+  const out = [];
+  let cur = null;
+  (j.words || []).forEach(function (w) {
+    if (w.type === 'audio_event') return;
+    const spk = (total > 1 ? (idx + 1) + '·' : '') + String(w.speaker_id || '');
+    if (w.type === 'spacing') { if (cur) cur.text += w.text; return; }
+    const st = o + (w.start || 0), en = o + (w.end || w.start || 0);
+    const brk = !cur || cur.speaker !== spk || st - cur.end > 2.5 || (cur.text.length > 600 && /[.!?…]\s*$/.test(cur.text));
+    if (brk) { if (cur) out.push(cur); cur = { start: st, end: en, speaker: spk, text: w.text }; }
+    else { cur.text += w.text; cur.end = en; }
+  });
+  if (cur) out.push(cur);
+  if (!(j.words || []).length && j.text) out.push({ start: o, end: o, speaker: '', text: j.text });
+  out.forEach(function (s) { s.text = String(s.text).replace(/\s+/g, ' ').trim(); });
+  return out.filter(function (s) { return s.text; });
+}
 
 function finalizeTranscript_(eng, audio, ctx) {
   let segs = eng.segs.slice().sort(function (a, b) { return a.start - b.start; });
@@ -1499,6 +1631,133 @@ function finalizeTranscript_(eng, audio, ctx) {
     speakers: speakers, warnings: eng.warnings || [], via: 'background'
   };
 }
+
+/* ---------- Підписування спікерів іменами з іншого тексту (копія з js/speakers.js) ---------- */
+
+// <shared>
+const SPK_STOP = { 'так': 1, 'вже': 1, 'але': 1, 'щоб': 1, 'якщо': 1, 'тому': 1, 'треба': 1, 'буде': 1, 'можна': 1, 'його': 1, 'вони': 1, 'воно': 1,
+  'цього': 1, 'того': 1, 'там': 1, 'тут': 1, 'теж': 1, 'ось': 1, 'отже': 1, 'значить': 1, 'окей': 1, 'добре': 1, 'давайте': 1, 'тобто': 1, 'який': 1,
+  'яка': 1, 'яке': 1, 'які': 1, 'для': 1, 'від': 1, 'при': 1, 'без': 1, 'про': 1, 'або': 1, 'ще': 1, 'нас': 1, 'вас': 1, 'нам': 1, 'вам': 1, 'мене': 1,
+  'тебе': 1, 'зараз': 1, 'потім': 1, 'просто': 1, 'типу': 1, 'кажу': 1, 'ага': 1, 'угу': 1, 'еее': 1, 'ммм': 1 };
+
+function spkIsRealName(n) {
+  n = String(n || '').trim();
+  if (!n || n.length < 2) return false;
+  if (/^(спікер|спикер|speaker|мовець|учасник|невідом|unknown|голос|чоловік|жінка|ведуч)/i.test(n)) return false;
+  if (/^\d+·/.test(n) || /^speaker_\d+$/i.test(n) || /^[A-Z]$/.test(n) || /^\d+$/.test(n)) return false;
+  return true;
+}
+
+function spkStems(text) {
+  const out = {};
+  let n = 0;
+  String(text || '').toLowerCase().replace(/[ʼ’'`]/g, '').split(/[^a-zа-яіїєґё0-9]+/i).forEach(function (w) {
+    if (w.length < 3 || SPK_STOP[w]) return;
+    const s = w.slice(0, 5);
+    if (!out[s]) { out[s] = 1; n++; }
+  });
+  return { set: out, size: n };
+}
+
+/** Мітки цільового тексту → імена з тексту-зразка. Повертає { map: {мітка: імʼя}, words: {мітка: слів} }. */
+function spkMatch(target, reference, refNameOf) {
+  const refs = (reference.segments || []).map(function (s, i, a) {
+    const next = a[i + 1];
+    let end = s.end > s.start ? s.end : (next ? next.start : s.start + 15);
+    if (end - s.start > 90) end = s.start + 90;
+    return { start: s.start, end: end, name: refNameOf(s.speaker), st: spkStems(s.text) };
+  });
+  const WIN = 60;
+  const votes = {}, words = {};
+  (target.segments || []).forEach(function (t) {
+    if (!t.speaker) return;
+    const ts = spkStems(t.text);
+    words[t.speaker] = (words[t.speaker] || 0) + ts.size;
+    if (ts.size < 3) return;
+    const tEnd = t.end > t.start ? t.end : t.start + 5;
+    const mid = (t.start + tEnd) / 2;
+    // Найсхожа репліка зразка поблизу; голос віддаємо, лише якщо вона помітно краща за схожу репліку іншої людини.
+    let best = null, second = 0;
+    refs.forEach(function (r) {
+      if (r.start > tEnd + WIN || r.end < t.start - WIN || !r.st.size) return;
+      let common = 0;
+      for (const k in ts.set) if (r.st.set[k]) common++;
+      if (common < 2) return;
+      const score = common / Math.min(ts.size, r.st.size) - Math.abs((r.start + r.end) / 2 - mid) / 600;
+      if (!best || score > best.score) { if (best && best.name !== r.name) second = Math.max(second, best.score); best = { score: score, name: r.name, common: common }; }
+      else if (r.name !== best.name) second = Math.max(second, score);
+    });
+    if (!best || best.score < 0.35 || !spkIsRealName(best.name) || second > best.score * 0.8) return;
+    const lv = votes[t.speaker] || (votes[t.speaker] = { _all: 0 });
+    lv[best.name] = (lv[best.name] || 0) + ts.size;
+    lv._all += ts.size;
+  });
+  const map = {};
+  for (const label in votes) {
+    const lv = votes[label];
+    let best = null;
+    for (const k in lv) if (k !== '_all' && (!best || lv[k] > lv[best])) best = k;
+    if (best && lv[best] >= 12 && lv[best] / lv._all >= 0.55 && lv[best] / Math.max(1, words[label]) >= 0.25) map[label] = best;
+  }
+  return { map: map, words: words };
+}
+
+/** Імʼя з тексту → id людини з довідника, якщо вдається однозначно; інакше саме імʼя. */
+function spkResolvePerson(name, people, participantIds) {
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) return name;
+  const list = people || [];
+  let hit = list.filter(function (p) { return String(p.name || '').trim().toLowerCase() === n; });
+  if (!hit.length) hit = list.filter(function (p) { return String(p.aliases || '').toLowerCase().split(/\s*,\s*/).indexOf(n) >= 0; });
+  if (!hit.length) {
+    // «Богдан» → «Богдан Смеречинський», якщо серед учасників такий один
+    const pool = list.filter(function (p) { return (participantIds || []).indexOf(p.id) >= 0; });
+    const first = n.split(/\s+/)[0];
+    hit = pool.filter(function (p) { const pn = String(p.name || '').toLowerCase().split(/\s+/); return pn[0] === first && (n.split(/\s+/).length === 1 || pn.join(' ').indexOf(n) === 0); });
+  }
+  return hit.length === 1 ? hit[0].id : name;
+}
+
+/**
+ * Для всіх текстів зі спікерами підписує ще не підписані мітки іменами з найкращого тексту-зразка.
+ * transcripts: {двигун: текст}; speakerMap: {двигун: {мітка: id людини або імʼя}}; people: [{id, name, aliases}].
+ * Повертає { speakerMap (новий), filled: {двигун: скільки міток підписано}, coverage: {двигун: частка слів з іменами}, reference }.
+ */
+function spkAutoMapAll(transcripts, speakerMap, people, participantIds) {
+  const byId = {};
+  (people || []).forEach(function (p) { byId[p.id] = p; });
+  const sm = {};
+  for (const e in (speakerMap || {})) { sm[e] = {}; for (const l in speakerMap[e]) sm[e][l] = speakerMap[e][l]; }
+  const nameOf = function (engine) {
+    const m = sm[engine] || {};
+    return function (label) { const v = m[label]; if (!v) return label; return byId[v] ? byId[v].name : v; };
+  };
+  const named = function (engine) {
+    const tr = transcripts[engine], f = nameOf(engine);
+    let all = 0, real = 0;
+    (tr.segments || []).forEach(function (s) { const w = String(s.text || '').length; all += w; if (s.speaker && spkIsRealName(f(s.speaker))) real += w; });
+    return all ? real / all : 0;
+  };
+  const ids = Object.keys(transcripts || {}).filter(function (e) { const t = transcripts[e]; return t && t.segments && t.segments.some(function (s) { return s.speaker; }); });
+  let reference = null, refScore = 0;
+  ids.forEach(function (e) { const sc = named(e) + (e === 'gemini' ? 0.05 : 0); if (sc > refScore) { refScore = sc; reference = e; } });
+  const filled = {}, coverage = {};
+  if (reference && refScore >= 0.5) {
+    const refNameOf = nameOf(reference);
+    ids.forEach(function (e) {
+      if (e === reference) return;
+      const r = spkMatch(transcripts[e], transcripts[reference], refNameOf);
+      const m = sm[e] || {};
+      let n = 0;
+      for (const label in r.map) if (!m[label]) { m[label] = spkResolvePerson(r.map[label], people, participantIds); n++; }
+      if (n) sm[e] = m;
+      filled[e] = n;
+    });
+  }
+  ids.forEach(function (e) { coverage[e] = Math.round(named(e) * 100) / 100; });
+  return { speakerMap: sm, filled: filled, coverage: coverage, reference: refScore >= 0.5 ? reference : null };
+}
+// </shared>
 
 /* ---------- Підсумок у фоні ---------- */
 
@@ -1554,7 +1813,10 @@ function analysisStep_(job, row, folder) {
     let cur = findById_(sh, row.id);
     const done = job.engines.filter(function (e) { return e.status === 'done'; }).map(function (e) { return e.id; });
     if (!job.primaryBefore && done.length) {
-      const best = done.filter(function (id) { return ENGINE_SPEAKERS[id]; })[0] || done[0];
+      let best = done.filter(function (id) { return ENGINE_SPEAKERS[id]; })[0] || done[0];
+      // Найточніший текст — ElevenLabs; основним робимо його, якщо більша частина реплік уже з іменами.
+      const cov = (job.mapped && job.mapped.coverage) || {};
+      if (done.indexOf('elevenlabs') >= 0 && (cov.elevenlabs || 0) >= 0.6) best = 'elevenlabs';
       if (cur.primaryEngine !== best) {
         saveMeetingState_({ meetingId: row.id, primaryEngine: best });
         cur = findById_(sh, row.id);

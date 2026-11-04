@@ -11,8 +11,9 @@ import { Recorder, pendingRecordings, assembleRecording, deleteRecording } from 
 import { idb } from './store.js';
 import { taskCard, editTask, sortTasks, isOverdue, weeklyReport, tasksText as tasksListText } from './tasks.js';
 import { syncIndex, searchAll, queryWords, snippet, highlight } from './search.js';
+import { spkAutoMapAll } from './speakers.js';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const view = $('#view');
 const S = {
   week: startOfWeek(new Date()),
@@ -568,7 +569,7 @@ function tabText(m, el) {
     } }, 'Видалити варіант'));
   put(el, actions);
 
-  if (tr.speakers && tr.speakers.length) put(el, speakerPanel(m, id, tr, () => { clear(el); tabText(m, el); }));
+  if (tr.speakers && tr.speakers.length) put(el, speakerPanel(m, id, tr, () => { clear(el); tabText(m, el); }, MV.transcripts));
 
   const q = h('input', { type: 'search', class: 'input', placeholder: 'Пошук у тексті…' });
   const list = h('div', { class: 'segs' });
@@ -598,9 +599,18 @@ function tabText(m, el) {
   }
 }
 
-function speakerPanel(m, engine, tr, redraw) {
+function speakerPanel(m, engine, tr, redraw, transcripts) {
   const people = api.peopleSync();
   const map = { ...((m.speakerMap || {})[engine] || {}) };
+  const save = async (all) => {
+    const r = await api.call('saveMeetingState', { meetingId: m.id, speakerMap: all });
+    m.speakerMap = r.speakerMap; MV.m = { ...MV.m, speakerMap: r.speakerMap }; S.meetings.set(r.id, { ...(S.meetings.get(r.id) || r), speakerMap: r.speakerMap });
+  };
+  // Чи є інший текст, з якого можна взяти імена (зазвичай Gemini)
+  const probe = transcripts ? spkAutoMapAll(transcripts, m.speakerMap || {}, people, m.participants || []) : null;
+  const refId = probe && probe.reference && probe.reference !== engine ? probe.reference : null;
+  const unnamed = tr.speakers.filter(l => !map[l]).length;
+  const canAuto = refId ? (probe.filled[engine] || 0) : 0;
   const partIds = m.participants || [];
   const ordered = [...people.filter(p => partIds.includes(p.id)), ...people.filter(p => !partIds.includes(p.id))];
   const rows = tr.speakers.map(label => {
@@ -609,6 +619,8 @@ function speakerPanel(m, engine, tr, redraw) {
     const sel = h('select', { class: 'input', onchange: (e) => { if (e.target.value) map[label] = e.target.value; else delete map[label]; } },
       h('option', { value: '' }, '— як є —'),
       ordered.map(p => h('option', { value: p.id }, p.name + (partIds.includes(p.id) ? '' : ' (не в учасниках)'))));
+    // Імʼя, яке не з довідника (наприклад, взяте з тексту Gemini), теж показуємо у списку
+    if (map[label] && !people.some(p => p.id === map[label])) sel.appendChild(h('option', { value: map[label] }, map[label] + ' (не з довідника)'));
     sel.value = map[label] || '';
     return h('div', { class: 'spkrow' },
       h('div', null, h('b', null, label), h('small', null, ` · ${segs.length} реплік`), h('div', { class: 'hint' }, `«${sample}…»`)),
@@ -617,11 +629,21 @@ function speakerPanel(m, engine, tr, redraw) {
   return h('details', { class: 'card spkpanel' },
     h('summary', null, 'Хто є хто — підписати спікерів'),
     people.length ? null : h('p', { class: 'hint' }, 'Спершу додай людей у розділі «Люди».'),
+    canAuto ? h('div', { class: 'banner small' },
+      h('span', null, `Можна підписати автоматично ${canAuto} з ${unnamed} — за збігом слів з текстом ${ENGINES[refId] ? ENGINES[refId].name : refId}.`),
+      h('button', { class: 'btn small', onclick: async (e) => {
+        e.target.disabled = true;
+        const r = spkAutoMapAll(transcripts, m.speakerMap || {}, people, m.participants || []);
+        const n = r.filled[engine] || 0;
+        if (!n) { toast('Не вдалося впевнено визначити, хто є хто — підпиши вручну.', 'info', 5000); e.target.disabled = false; return; }
+        try { await save({ ...(m.speakerMap || {}), [engine]: r.speakerMap[engine] }); }
+        catch (err) { toast(err.message, 'err'); e.target.disabled = false; return; }
+        toast(`Підписано ${n} з ${unnamed}. Перевір — і перезроби підсумок, якщо цей текст основний.`, 'ok', 6000);
+        redraw();
+      } }, 'Підписати')) : null,
     rows,
     h('div', { class: 'row' }, h('button', { class: 'btn small primary', onclick: async () => {
-      const all = { ...(m.speakerMap || {}), [engine]: map };
-      const r = await api.call('saveMeetingState', { meetingId: m.id, speakerMap: all });
-      m.speakerMap = r.speakerMap; S.meetings.set(r.id, r);
+      await save({ ...(m.speakerMap || {}), [engine]: map });
       toast('Імена збережено. Щоб вони потрапили в підсумок — перезроби його.', 'ok', 5000);
       redraw();
     } }, 'Зберегти імена')));

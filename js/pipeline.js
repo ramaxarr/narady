@@ -7,6 +7,7 @@ import { call, loadConfig, getPeople, getGlossary } from './api.js';
 import { transcribe, analyze, ENGINES } from './engines.js';
 import { savePrepared, getPrepared, trimPrepared } from './store.js';
 import { fmtDateFull, fmtTime, ymd } from './ui.js';
+import { spkAutoMapAll } from './speakers.js';
 
 const jobs = new Map();
 const listeners = new Set();
@@ -310,17 +311,26 @@ async function runEngines(meeting, prepared, engines, job, analyzeAfter) {
     }
   }));
   if (!Object.keys(results).length) throw new Error('Жоден двигун не впорався');
+  const all = await call('getTranscripts', { meetingId: meeting.id });
+  // Мітки спікерів без імен (ElevenLabs, OpenAI) підписуємо іменами з тексту, де вони вже є (Gemini).
+  const auto = spkAutoMapAll(all, latest.speakerMap || {}, ctx.people, meeting.participants || []);
+  const patch = {};
+  if (Object.values(auto.filled).some(n => n > 0)) patch.speakerMap = auto.speakerMap;
   if (!meeting.primaryEngine) {
-    // Основним робимо перший обраний двигун, що розрізняє спікерів, а не той, що відповів найшвидше.
+    // Основним — перший обраний двигун, що розрізняє спікерів; ElevenLabs (найточніший) — якщо його репліки вже з іменами.
     const ok = engines.filter(id => results[id]);
-    const best = ok.find(id => ENGINES[id].speakers) || ok[0];
-    if (best && latest.primaryEngine !== best) latest = await call('saveMeetingState', { meetingId: meeting.id, primaryEngine: best });
+    let best = ok.find(id => ENGINES[id].speakers) || ok[0];
+    if (results.elevenlabs && (auto.coverage.elevenlabs || 0) >= 0.6) best = 'elevenlabs';
+    if (best && latest.primaryEngine !== best) patch.primaryEngine = best;
+  }
+  if (Object.keys(patch).length) latest = await call('saveMeetingState', { meetingId: meeting.id, ...patch });
+  const refName = auto.reference && ENGINES[auto.reference] ? ENGINES[auto.reference].name : '';
+  for (const id of Object.keys(auto.filled)) {
+    const st = job.steps.find(x => x.id === 'eng_' + id);
+    if (auto.filled[id] && st && st.status === 'ok') job.set(st.id, { detail: `${st.detail} · імена з ${refName}: ${auto.filled[id]}` });
   }
   job.meeting = latest;
-  if (analyzeAfter) {
-    const all = await call('getTranscripts', { meetingId: meeting.id });
-    latest = await analyzeStep(latest, all, job);
-  }
+  if (analyzeAfter) latest = await analyzeStep(latest, all, job);
   return latest;
 }
 

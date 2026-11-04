@@ -269,6 +269,7 @@ textarea.input { resize: vertical; min-height: 80px; }
 .ts { border: 0; background: none; color: var(--muted); font: inherit; font-size: 12.5px; font-variant-numeric: tabular-nums; cursor: pointer; padding: 2px 0; text-align: left; align-self: start; }
 .ts:hover { color: var(--accent); }
 .spkpanel summary { cursor: pointer; font-weight: 600; }
+.spkpanel .banner { background: var(--accent-soft); }
 .spkrow { display: grid; grid-template-columns: 1fr 200px; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
 @media (max-width: 560px) { .spkrow { grid-template-columns: 1fr; } }
 
